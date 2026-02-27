@@ -1,4 +1,3 @@
-// indexer.js
 require("dotenv").config();
 
 const fs = require("fs");
@@ -10,6 +9,12 @@ const { Server } = require("socket.io");
 
 // your local db helpers (must export: db, hasSeenTx, markTxSeen, upsertLaunch, insertTrade)
 const { db, hasSeenTx, markTxSeen, upsertLaunch, insertTrade } = require("./db");
+
+// fetch compat (Node 18+ has global fetch; older needs node-fetch)
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  fetchFn = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+}
 
 const PROGRAM_ID = process.env.PROGRAM_ID;
 const IDL_PATH = process.env.IDL_PATH;
@@ -33,12 +38,46 @@ const io = new Server(server, {
 
 const WS_PORT = Number(process.env.WS_PORT || 3010);
 
+// --------------------
+// Rooms / subrooms
+// --------------------
+const VALID_TOPICS = new Set(["trades", "launch", "migration", "meta", "prices", "events"]);
+
+function mintRoom(mint, topic) {
+  return `mint:${mint}:${topic}`;
+}
+function globalRoom(topic) {
+  return `global:${topic}`;
+}
+
 io.on("connection", (socket) => {
-  socket.on("join", ({ mint }) => {
-    if (mint && typeof mint === "string") socket.join(`mint:${mint}`);
+  // New join format:
+  // socket.emit("join", { mint: "<mint>" (optional), topic: "trades|launch|migration|meta|prices|events" })
+  socket.on("join", ({ mint, topic }) => {
+    try {
+      if (!topic || !VALID_TOPICS.has(topic)) return;
+
+      // global room if no mint passed
+      if (!mint) return socket.join(globalRoom(topic));
+
+      if (typeof mint === "string") socket.join(mintRoom(mint, topic));
+    } catch {}
   });
-  socket.on("leave", ({ mint }) => {
-    if (mint && typeof mint === "string") socket.leave(`mint:${mint}`);
+
+  socket.on("leave", ({ mint, topic }) => {
+    try {
+      if (!topic || !VALID_TOPICS.has(topic)) return;
+
+      if (!mint) return socket.leave(globalRoom(topic));
+
+      if (typeof mint === "string") socket.leave(mintRoom(mint, topic));
+    } catch {}
+  });
+
+  // backwards compatibility for your old UI:
+  // socket.emit("join", { mint: "<mint>" }) -> joins mint:<mint>:events
+  socket.on("joinLegacyMint", ({ mint }) => {
+    if (mint && typeof mint === "string") socket.join(mintRoom(mint, "events"));
   });
 });
 
@@ -65,7 +104,8 @@ CREATE TABLE IF NOT EXISTS prices (
 // --------------------
 // Raydium SOL/USDC pair used by Dexscreener UI commonly:
 // https://dexscreener.com/solana/58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2
-const SOL_PAIR = process.env.DEX_SOL_PAIR || "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2";
+const SOL_PAIR =
+  process.env.DEX_SOL_PAIR || "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2";
 const DEX_URL = `https://api.dexscreener.com/latest/dex/pairs/solana/${SOL_PAIR}`;
 
 function nowSec() {
@@ -85,18 +125,24 @@ function getPrice(key) {
 }
 
 async function pollSolPriceOnce() {
-  const res = await fetch(DEX_URL, { method: "GET" });
+  const res = await fetchFn(DEX_URL, { method: "GET" });
   if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const json = await res.json();
 
   const pair = json?.pairs?.[0];
   const priceUsd = pair?.priceUsd ? Number(pair.priceUsd) : null;
-  if (!priceUsd || !Number.isFinite(priceUsd)) throw new Error("No priceUsd in Dexscreener response");
+  if (!priceUsd || !Number.isFinite(priceUsd)) {
+    throw new Error("No priceUsd in Dexscreener response");
+  }
 
   setPrice("SOL_USD", priceUsd);
 
-  // broadcast to UI
-  io.emit("price", { key: "SOL_USD", price: priceUsd, updated_at: nowSec() });
+  // broadcast to UI (global prices)
+  const payload = { key: "SOL_USD", price: priceUsd, updated_at: nowSec() };
+  io.to(globalRoom("prices")).emit("price", payload);
+
+  // optional: also emit a raw global event feed if you want
+  io.to(globalRoom("events")).emit("price", payload);
 }
 
 function startSolPricePoller() {
@@ -110,7 +156,6 @@ function startSolPricePoller() {
     }
   };
 
-  // run immediately + interval
   loop();
   setInterval(loop, intervalMs);
 
@@ -142,6 +187,20 @@ function asStrMaybePk(v) {
   return null;
 }
 
+function topicForEvent(eventName) {
+  // routes events into your subrooms
+  if (eventName === "BuyExecuted" || eventName === "SellExecuted" || eventName === "CurveActivated")
+    return "trades";
+
+  if (eventName === "LaunchInitialized") return "launch";
+  if (eventName === "MetadataInitialized") return "meta";
+
+  if (eventName === "MigrationPending" || eventName === "MigratedToCore") return "migration";
+
+  // everything else still goes to events
+  return "events";
+}
+
 // --------------------
 // Helius WS connection (logsSubscribe)
 // --------------------
@@ -167,7 +226,7 @@ function connect() {
   ws.on("open", () => {
     console.log("Connected to Helius WS");
 
-    // keepalive ping (some providers drop idle sockets)
+    // keepalive ping
     pingInterval = setInterval(() => {
       try {
         ws.ping();
@@ -209,18 +268,18 @@ function connect() {
     const err = value.err;
 
     if (!sig) return;
-    if (err) return; // ignore failed txs for now
+    if (err) return;
 
     // de-dupe tx processing
     if (hasSeenTx(sig)) return;
     markTxSeen(sig, ctxSlot);
 
-    // scan for Anchor event payloads
     for (const line of logs) {
       const prefix = "Program data: ";
       if (!line.startsWith(prefix)) continue;
 
       const b64 = line.slice(prefix.length).trim();
+
       let buf;
       try {
         buf = Buffer.from(b64, "base64");
@@ -244,7 +303,7 @@ function connect() {
       const user = asStrMaybePk(payload.user);
 
       // -----------------------------------------
-      // 1) launches table upserts (token metadata)
+      // 1) launches table upserts
       // -----------------------------------------
       if (eventName === "LaunchInitialized") {
         upsertLaunch(mint, {
@@ -263,20 +322,17 @@ function connect() {
       }
 
       if (eventName === "MetadataInitialized") {
-        // NOTE: your event includes name/symbol/uri directly
         upsertLaunch(mint, {
           name: payload.name ?? null,
           symbol: payload.symbol ?? null,
           metadata_uri: payload.uri ?? null,
-          state_u8: null,
         });
       }
 
       // -----------------------------------------
-      // 2) trades table inserts (volume game mode)
+      // 2) trades inserts
       // -----------------------------------------
       if (eventName === "CurveActivated") {
-        // DEVBUY equivalent
         insertTrade({
           sig,
           slot: ctxSlot,
@@ -349,20 +405,34 @@ function connect() {
       }
 
       // -----------------------------------------
-      // 3) broadcast raw event to website
+      // 3) broadcast to rooms
       // -----------------------------------------
-      io.emit("event", { sig, slot: ctxSlot, eventName, mint, user, payload });
+      const topic = topicForEvent(eventName);
 
+      const packet = { sig, slot: ctxSlot, eventName, mint, user, payload };
+
+      // global topic room
+      io.to(globalRoom(topic)).emit("event", packet);
+
+      // always also push into global events feed
+      io.to(globalRoom("events")).emit("event", packet);
+
+      // mint topic room + mint events room
       if (mint) {
-        io.to(`mint:${mint}`).emit("event", { sig, slot: ctxSlot, eventName, mint, user, payload });
+        io.to(mintRoom(mint, topic)).emit("event", packet);
+        io.to(mintRoom(mint, "events")).emit("event", packet);
+
+        // backwards compatibility: if any old clients still join `mint:<mint>` (no topic)
+        // you can optionally support this by ALSO emitting to that legacy name:
+        io.to(`mint:${mint}`).emit("event", packet);
       }
 
-      // optional: also broadcast current SOL price snapshot sometimes
-      if (eventName === "BuyExecuted" || eventName === "SellExecuted") {
+      // when trades happen, also push latest SOL price snapshot into those same scopes
+      if (topic === "trades") {
         const p = getPrice("SOL_USD");
         if (p?.price) {
-          io.emit("price", p);
-          if (mint) io.to(`mint:${mint}`).emit("price", p);
+          io.to(globalRoom("prices")).emit("price", p);
+          if (mint) io.to(mintRoom(mint, "prices")).emit("price", p);
         }
       }
     }
