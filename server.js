@@ -2,61 +2,73 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
-const WebSocket = require("ws");
+const { Server } = require("socket.io");
+
 const { startIndexer } = require("./indexer");
 
+// --------------------
+// HTTP + Socket.IO (DOWNSTREAM)
+// --------------------
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
 
-const clients = new Map(); // ws -> { mints:Set<string> }
-
-function broadcast(msg) {
-  const mint = msg?.data?.mint?.toBase58 ? msg.data.mint.toBase58() : (msg?.data?.mint || null);
-
-  for (const [ws, state] of clients.entries()) {
-    if (ws.readyState !== WebSocket.OPEN) continue;
-
-    // if client joined rooms, filter; otherwise global
-    if (state.mints.size > 0) {
-      if (!mint || !state.mints.has(mint)) continue;
-    }
-
-    ws.send(JSON.stringify(msg));
-  }
-}
-
-wss.on("connection", (ws) => {
-  clients.set(ws, { mints: new Set() });
-
-  ws.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type === "join" && msg.mint) {
-        clients.get(ws).mints.add(String(msg.mint));
-      }
-      if (msg.type === "leave" && msg.mint) {
-        clients.get(ws).mints.delete(String(msg.mint));
-      }
-      if (msg.type === "joinAll") {
-        clients.get(ws).mints.clear();
-      }
-    } catch {}
-  });
-
-  ws.on("close", () => clients.delete(ws));
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
+// Room contract (clients -> join/leave)
+io.on("connection", (socket) => {
+  // Join a mint-scoped room group
+  // Example: socket.emit("joinMint", { mint: "<mint>" })
+  socket.on("joinMint", ({ mint }) => {
+    if (mint && typeof mint === "string") {
+      socket.join(`mint:${mint}`);
+      socket.emit("joined", { room: `mint:${mint}` });
+    }
+  });
+
+  socket.on("leaveMint", ({ mint }) => {
+    if (mint && typeof mint === "string") {
+      socket.leave(`mint:${mint}`);
+      socket.emit("left", { room: `mint:${mint}` });
+    }
+  });
+
+  // Join specific topic rooms (optional)
+  // Example: socket.emit("joinRoom", { room: "global:trades" })
+  socket.on("joinRoom", ({ room }) => {
+    if (room && typeof room === "string") {
+      socket.join(room);
+      socket.emit("joined", { room });
+    }
+  });
+
+  socket.on("leaveRoom", ({ room }) => {
+    if (room && typeof room === "string") {
+      socket.leave(room);
+      socket.emit("left", { room });
+    }
+  });
+
+  // Convenience: join all globals
+  socket.on("joinGlobals", () => {
+    const rooms = ["global:launch", "global:trades", "global:migration", "global:prices", "global:events"];
+    rooms.forEach((r) => socket.join(r));
+    socket.emit("joinedGlobals", { rooms });
+  });
+});
+
+// Start indexer (UPSTREAM) and give it `io` to emit to rooms
 (async () => {
-  // start indexer loop
-  await startIndexer({ broadcast });
+  await startIndexer({ io });
 
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => {
-    console.log(`Indexer WS/API running on port ${PORT}`);
+    console.log(`HTTP+Socket server listening on :${PORT}`);
+    console.log(`Socket.IO path: /socket.io  (same port)`);
   });
 })();
