@@ -1,20 +1,15 @@
+// indexer.js
 require("dotenv").config();
 
 const fs = require("fs");
 const WebSocket = require("ws");
 const anchor = require("@coral-xyz/anchor");
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
 
 // your local db helpers (must export: db, hasSeenTx, markTxSeen, upsertLaunch, insertTrade)
 const { db, hasSeenTx, markTxSeen, upsertLaunch, insertTrade } = require("./db");
 
-// fetch compat (Node 18+ has global fetch; older needs node-fetch)
-let fetchFn = global.fetch;
-if (!fetchFn) {
-  fetchFn = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-}
+// Node 18+ has global fetch. If you're on Node 16, install node-fetch and uncomment below.
+// const fetch = require("node-fetch");
 
 const PROGRAM_ID = process.env.PROGRAM_ID;
 const IDL_PATH = process.env.IDL_PATH;
@@ -26,90 +21,62 @@ if (!fs.existsSync(IDL_PATH)) throw new Error(`IDL_PATH not found: ${IDL_PATH}`)
 const idl = JSON.parse(fs.readFileSync(IDL_PATH, "utf8"));
 const coder = new anchor.BorshCoder(idl);
 
-// --------------------
-// Web UI socket server
-// --------------------
-const app = express();
-const server = http.createServer(app);
+// ------------------------------------------------------------
+// Rooms / Topics (DOWNSTREAM EMIT CONTRACT)
+// ------------------------------------------------------------
+// Global rooms:
+const ROOMS = {
+  GLOBAL_EVENTS: "global:events",
+  GLOBAL_TRADES: "global:trades",
+  GLOBAL_LAUNCH: "global:launch",
+  GLOBAL_MIGRATION: "global:migration",
+  GLOBAL_PRICES: "global:prices",
+};
 
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-});
-
-const WS_PORT = Number(process.env.WS_PORT || 3010);
-
-// --------------------
-// Rooms / subrooms
-// --------------------
-const VALID_TOPICS = new Set(["trades", "launch", "migration", "meta", "prices", "events"]);
-
+// Mint namespace root: `mint:<mint>`
+// Mint-scoped topic rooms:
+// - `mint:<mint>:events`
+// - `mint:<mint>:trades`
+// - `mint:<mint>:launch`
+// - `mint:<mint>:migration`
+// - `mint:<mint>:prices`
 function mintRoom(mint, topic) {
   return `mint:${mint}:${topic}`;
 }
-function globalRoom(topic) {
-  return `global:${topic}`;
-}
-
-io.on("connection", (socket) => {
-  // New join format:
-  // socket.emit("join", { mint: "<mint>" (optional), topic: "trades|launch|migration|meta|prices|events" })
-  socket.on("join", ({ mint, topic }) => {
-    try {
-      if (!topic || !VALID_TOPICS.has(topic)) return;
-
-      // global room if no mint passed
-      if (!mint) return socket.join(globalRoom(topic));
-
-      if (typeof mint === "string") socket.join(mintRoom(mint, topic));
-    } catch {}
-  });
-
-  socket.on("leave", ({ mint, topic }) => {
-    try {
-      if (!topic || !VALID_TOPICS.has(topic)) return;
-
-      if (!mint) return socket.leave(globalRoom(topic));
-
-      if (typeof mint === "string") socket.leave(mintRoom(mint, topic));
-    } catch {}
-  });
-
-  // backwards compatibility for your old UI:
-  // socket.emit("join", { mint: "<mint>" }) -> joins mint:<mint>:events
-  socket.on("joinLegacyMint", ({ mint }) => {
-    if (mint && typeof mint === "string") socket.join(mintRoom(mint, "events"));
-  });
-});
-
-server.listen(WS_PORT, () => {
-  console.log(`Indexer socket server on :${WS_PORT}`);
-});
-
-// quick health
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// --------------------
-// DB bootstrap (extra tables for indexer)
-// --------------------
-db.exec(`
-CREATE TABLE IF NOT EXISTS prices (
-  key TEXT PRIMARY KEY,
-  price REAL,
-  updated_at INTEGER NOT NULL
-);
-`);
-
-// --------------------
-// SOL price poller (Dexscreener)
-// --------------------
-// Raydium SOL/USDC pair used by Dexscreener UI commonly:
-// https://dexscreener.com/solana/58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2
-const SOL_PAIR =
-  process.env.DEX_SOL_PAIR || "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2";
-const DEX_URL = `https://api.dexscreener.com/latest/dex/pairs/solana/${SOL_PAIR}`;
 
 function nowSec() {
   return Math.floor(Date.now() / 1000);
+}
+
+function safeJson(v) {
+  return JSON.stringify(v, (_, val) => {
+    if (val && typeof val === "object") {
+      if (typeof val.toBase58 === "function") return val.toBase58(); // PublicKey
+      if (val.constructor && val.constructor.name === "BN") return val.toString(); // BN
+    }
+    return val;
+  });
+}
+
+function asStrMaybePk(v) {
+  if (!v) return null;
+  if (typeof v === "string") return v;
+  if (typeof v.toBase58 === "function") return v.toBase58();
+  if (typeof v.toString === "function") return v.toString();
+  return null;
+}
+
+// ------------------------------------------------------------
+// DB bootstrap (extra tables for indexer)
+// ------------------------------------------------------------
+function ensureIndexerTables() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS prices (
+      key TEXT PRIMARY KEY,
+      price REAL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
 }
 
 function setPrice(key, price) {
@@ -124,33 +91,41 @@ function getPrice(key) {
   return db.prepare(`SELECT key, price, updated_at FROM prices WHERE key=?`).get(key);
 }
 
+// ------------------------------------------------------------
+// SOL price poller (Dexscreener)
+// ------------------------------------------------------------
+// Dexscreener pair endpoint: /latest/dex/pairs/solana/<pairAddress>
+const SOL_PAIR =
+  process.env.DEX_SOL_PAIR ||
+  "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2"; // common SOL/USDC Raydium pair
+const DEX_URL = `https://api.dexscreener.com/latest/dex/pairs/solana/${SOL_PAIR}`;
+
 async function pollSolPriceOnce() {
-  const res = await fetchFn(DEX_URL, { method: "GET" });
+  const res = await fetch(DEX_URL, { method: "GET" });
   if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const json = await res.json();
 
   const pair = json?.pairs?.[0];
   const priceUsd = pair?.priceUsd ? Number(pair.priceUsd) : null;
-  if (!priceUsd || !Number.isFinite(priceUsd)) {
-    throw new Error("No priceUsd in Dexscreener response");
-  }
+  if (!priceUsd || !Number.isFinite(priceUsd)) throw new Error("No priceUsd in Dexscreener response");
 
   setPrice("SOL_USD", priceUsd);
 
-  // broadcast to UI (global prices)
-  const payload = { key: "SOL_USD", price: priceUsd, updated_at: nowSec() };
-  io.to(globalRoom("prices")).emit("price", payload);
-
-  // optional: also emit a raw global event feed if you want
-  io.to(globalRoom("events")).emit("price", payload);
+  return { key: "SOL_USD", price: priceUsd, updated_at: nowSec() };
 }
 
-function startSolPricePoller() {
+function startSolPricePoller({ io }) {
   const intervalMs = Number(process.env.SOL_PRICE_INTERVAL_MS || 15_000);
 
   const loop = async () => {
     try {
-      await pollSolPriceOnce();
+      const p = await pollSolPriceOnce();
+
+      // global price stream
+      io.to(ROOMS.GLOBAL_PRICES).emit("price", p);
+      io.emit("price", p); // also broadcast to anyone not in rooms (optional)
+
+      // NOTE: per-mint price rooms are for later (token USD prices), not SOL.
     } catch (e) {
       console.error("SOL price poll error:", e.message);
     }
@@ -162,48 +137,9 @@ function startSolPricePoller() {
   console.log(`SOL price poller started (${intervalMs}ms) using pair ${SOL_PAIR}`);
 }
 
-startSolPricePoller();
-
-// --------------------
-// Anchor event helpers
-// --------------------
-function safeJson(v) {
-  return JSON.stringify(v, (_, val) => {
-    if (val && typeof val === "object") {
-      // PublicKey
-      if (typeof val.toBase58 === "function") return val.toBase58();
-      // BN
-      if (val.constructor && val.constructor.name === "BN") return val.toString();
-    }
-    return val;
-  });
-}
-
-function asStrMaybePk(v) {
-  if (!v) return null;
-  if (typeof v === "string") return v;
-  if (typeof v.toBase58 === "function") return v.toBase58();
-  if (typeof v.toString === "function") return v.toString();
-  return null;
-}
-
-function topicForEvent(eventName) {
-  // routes events into your subrooms
-  if (eventName === "BuyExecuted" || eventName === "SellExecuted" || eventName === "CurveActivated")
-    return "trades";
-
-  if (eventName === "LaunchInitialized") return "launch";
-  if (eventName === "MetadataInitialized") return "meta";
-
-  if (eventName === "MigrationPending" || eventName === "MigratedToCore") return "migration";
-
-  // everything else still goes to events
-  return "events";
-}
-
-// --------------------
-// Helius WS connection (logsSubscribe)
-// --------------------
+// ------------------------------------------------------------
+// Helius WS connection (UPSTREAM)
+// ------------------------------------------------------------
 const HELIUS_WSS =
   process.env.HELIUS_WSS ||
   `wss://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
@@ -213,20 +149,20 @@ if (!HELIUS_WSS.startsWith("wss://")) throw new Error("HELIUS_WSS must be a wss:
 let ws;
 let pingInterval = null;
 
-function cleanup() {
+function cleanupUpstream() {
   try {
     if (pingInterval) clearInterval(pingInterval);
   } catch {}
   pingInterval = null;
 }
 
-function connect() {
+function connectUpstream({ io }) {
   ws = new WebSocket(HELIUS_WSS);
 
   ws.on("open", () => {
     console.log("Connected to Helius WS");
 
-    // keepalive ping
+    // keepalive ping (some providers drop idle sockets)
     pingInterval = setInterval(() => {
       try {
         ws.ping();
@@ -268,12 +204,13 @@ function connect() {
     const err = value.err;
 
     if (!sig) return;
-    if (err) return;
+    if (err) return; // ignore failed txs for now
 
     // de-dupe tx processing
     if (hasSeenTx(sig)) return;
     markTxSeen(sig, ctxSlot);
 
+    // scan for Anchor event payloads
     for (const line of logs) {
       const prefix = "Program data: ";
       if (!line.startsWith(prefix)) continue;
@@ -293,7 +230,6 @@ function connect() {
       } catch {
         continue;
       }
-
       if (!decoded) continue;
 
       const eventName = decoded.name;
@@ -302,9 +238,9 @@ function connect() {
       const mint = asStrMaybePk(payload.mint);
       const user = asStrMaybePk(payload.user);
 
-      // -----------------------------------------
-      // 1) launches table upserts
-      // -----------------------------------------
+      // -----------------------------
+      // Upserts / Normalization
+      // -----------------------------
       if (eventName === "LaunchInitialized") {
         upsertLaunch(mint, {
           launch_state: asStrMaybePk(payload.launch_state),
@@ -318,7 +254,22 @@ function connect() {
           name: null,
           symbol: null,
           metadata_uri: null,
+          // optional fields you have in db schema:
+          description: null,
+          image: null,
+          pinata_cid: null,
         });
+
+        // Launch topic emits
+        const evt = { sig, slot: ctxSlot, eventName, mint, user, payload };
+        io.to(ROOMS.GLOBAL_LAUNCH).emit("event", evt);
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(`mint:${mint}`).emit("event", evt); // general mint namespace
+          io.to(mintRoom(mint, "launch")).emit("event", evt);
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+        }
+        continue;
       }
 
       if (eventName === "MetadataInitialized") {
@@ -327,11 +278,19 @@ function connect() {
           symbol: payload.symbol ?? null,
           metadata_uri: payload.uri ?? null,
         });
+
+        const evt = { sig, slot: ctxSlot, eventName, mint, user, payload };
+        io.to(ROOMS.GLOBAL_LAUNCH).emit("event", evt);
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(`mint:${mint}`).emit("event", evt);
+          io.to(mintRoom(mint, "launch")).emit("event", evt);
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+        }
+        continue;
       }
 
-      // -----------------------------------------
-      // 2) trades inserts
-      // -----------------------------------------
+      // Trades normalization (your volume/game mode table)
       if (eventName === "CurveActivated") {
         insertTrade({
           sig,
@@ -354,6 +313,16 @@ function connect() {
           sol_collected_total: null,
           ts_i64: payload.ts?.toString?.() ?? null,
         });
+
+        const evt = { sig, slot: ctxSlot, eventName, mint, user: asStrMaybePk(payload.dev), payload };
+        io.to(ROOMS.GLOBAL_TRADES).emit("event", evt);
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(mintRoom(mint, "trades")).emit("event", evt);
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+          io.to(`mint:${mint}`).emit("event", evt);
+        }
+        continue;
       }
 
       if (eventName === "BuyExecuted") {
@@ -378,6 +347,23 @@ function connect() {
           sol_collected_total: payload.sol_collected_total?.toString?.() ?? null,
           ts_i64: payload.ts?.toString?.() ?? null,
         });
+
+        const evt = { sig, slot: ctxSlot, eventName, mint, user, payload };
+        io.to(ROOMS.GLOBAL_TRADES).emit("event", evt);
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(mintRoom(mint, "trades")).emit("event", evt);
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+          io.to(`mint:${mint}`).emit("event", evt);
+        }
+
+        // Optional: include SOL price snapshot on trade ticks
+        const p = getPrice("SOL_USD");
+        if (p?.price) {
+          io.to(ROOMS.GLOBAL_PRICES).emit("price", p);
+          if (mint) io.to(mintRoom(mint, "prices")).emit("price", p);
+        }
+        continue;
       }
 
       if (eventName === "SellExecuted") {
@@ -402,37 +388,44 @@ function connect() {
           sol_collected_total: payload.sol_collected_total?.toString?.() ?? null,
           ts_i64: payload.ts?.toString?.() ?? null,
         });
-      }
 
-      // -----------------------------------------
-      // 3) broadcast to rooms
-      // -----------------------------------------
-      const topic = topicForEvent(eventName);
+        const evt = { sig, slot: ctxSlot, eventName, mint, user, payload };
+        io.to(ROOMS.GLOBAL_TRADES).emit("event", evt);
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(mintRoom(mint, "trades")).emit("event", evt);
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+          io.to(`mint:${mint}`).emit("event", evt);
+        }
 
-      const packet = { sig, slot: ctxSlot, eventName, mint, user, payload };
-
-      // global topic room
-      io.to(globalRoom(topic)).emit("event", packet);
-
-      // always also push into global events feed
-      io.to(globalRoom("events")).emit("event", packet);
-
-      // mint topic room + mint events room
-      if (mint) {
-        io.to(mintRoom(mint, topic)).emit("event", packet);
-        io.to(mintRoom(mint, "events")).emit("event", packet);
-
-        // backwards compatibility: if any old clients still join `mint:<mint>` (no topic)
-        // you can optionally support this by ALSO emitting to that legacy name:
-        io.to(`mint:${mint}`).emit("event", packet);
-      }
-
-      // when trades happen, also push latest SOL price snapshot into those same scopes
-      if (topic === "trades") {
         const p = getPrice("SOL_USD");
         if (p?.price) {
-          io.to(globalRoom("prices")).emit("price", p);
+          io.to(ROOMS.GLOBAL_PRICES).emit("price", p);
           if (mint) io.to(mintRoom(mint, "prices")).emit("price", p);
+        }
+        continue;
+      }
+
+      // Migration topic emits (if your program emits these)
+      if (eventName === "MigrationPending" || eventName === "MigratedToCore") {
+        const evt = { sig, slot: ctxSlot, eventName, mint, user, payload };
+        io.to(ROOMS.GLOBAL_MIGRATION).emit("event", evt);
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(mintRoom(mint, "migration")).emit("event", evt);
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+          io.to(`mint:${mint}`).emit("event", evt);
+        }
+        continue;
+      }
+
+      // Fallback: broadcast all events to general channels
+      {
+        const evt = { sig, slot: ctxSlot, eventName, mint, user, payload };
+        io.to(ROOMS.GLOBAL_EVENTS).emit("event", evt);
+        if (mint) {
+          io.to(mintRoom(mint, "events")).emit("event", evt);
+          io.to(`mint:${mint}`).emit("event", evt);
         }
       }
     }
@@ -440,8 +433,8 @@ function connect() {
 
   ws.on("close", () => {
     console.log("Helius WS closed. Reconnecting...");
-    cleanup();
-    setTimeout(connect, 1500);
+    cleanupUpstream();
+    setTimeout(() => connectUpstream({ io }), 1500);
   });
 
   ws.on("error", (e) => {
@@ -449,4 +442,22 @@ function connect() {
   });
 }
 
-connect();
+// ------------------------------------------------------------
+// Public entrypoint
+// ------------------------------------------------------------
+async function startIndexer({ io }) {
+  if (!io) throw new Error("startIndexer requires { io } from server.js");
+
+  ensureIndexerTables();
+
+  // start downstream pollers (SOL price)
+  startSolPricePoller({ io });
+
+  // connect upstream (Helius program logs)
+  connectUpstream({ io });
+
+  console.log("Indexer started");
+  console.log("Rooms:", ROOMS);
+}
+
+module.exports = { startIndexer };
