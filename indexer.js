@@ -39,6 +39,7 @@ const TOTAL_SUPPLY_TOKENS = 1_000_000_000; // ✅ 1,000,000,000.000000
 const TOTAL_SUPPLY_BASE = TOTAL_SUPPLY_TOKENS * TOKEN_DECIMALS;
 const V_SOL = 75.8;           // virtual SOL
 const V_TOK = 526_200_000;    // virtual tokens
+const ENABLE_GLOBAL_EVENTS = process.env.ENABLE_GLOBAL_EVENTS === "true";
 
 const TF_SECONDS = {
   "1m": 60,
@@ -234,6 +235,38 @@ server.listen(WS_PORT, () => {
   console.log(`Indexer socket server on :${WS_PORT}`);
 });
 
+const candleEmitThrottle = new Map(); // mint -> lastEmitMs
+
+function emitCandleThrottled(mint, candle) {
+  const nowMs = Date.now();
+  const last = candleEmitThrottle.get(mint) || 0;
+  if (nowMs - last < 1000) return; // max 1/sec per mint
+  candleEmitThrottle.set(mint, nowMs);
+
+  io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+}
+
+const TICK_FLUSH_MS = Number(process.env.TICK_FLUSH_MS || 250);
+
+// latest tick per mint (overwritten frequently)
+const pendingTicks = new Map(); // mint -> tick
+
+function queueTick(mint, tick) {
+  if (!mint) return;
+  pendingTicks.set(mint, tick);
+}
+
+setInterval(() => {
+  if (pendingTicks.size === 0) return;
+
+  // flush each mint once per interval
+  for (const [mint, tick] of pendingTicks.entries()) {
+    io.to(`mint:${mint}:ticks`).emit("tick", tick);
+  }
+  pendingTicks.clear();
+}, TICK_FLUSH_MS);
+
+console.log(`Tick batching enabled: flush every ${TICK_FLUSH_MS}ms`);
 // --------------------
 // SOL price poller (Dexscreener)
 // --------------------
@@ -331,15 +364,13 @@ function emitTick(mint, ts, side, priceSol) {
   const solUsd = getPrice("SOL_USD")?.price || null;
   const priceUsd = solUsd ? priceSol * solUsd : null;
 
-  const tick = {
+  queueTick(mint, {
     mint,
     ts,
     side,
     price_sol: priceSol,
     price_usd: priceUsd,
-  };
-
-  io.to(`mint:${mint}:ticks`).emit("tick", tick);
+  });
 }
 
 function upsertCandle1m(mint, tsSec, priceSol, volSol, volTokens, side) {
@@ -680,7 +711,7 @@ function connect() {
           const volTok = (Number(tokBase) / TOKEN_DECIMALS);
 
           const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "DEVBUY");
-          io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+          emitCandleThrottled(mint, candle);
 
           emitTick(mint, ts, "DEVBUY", priceSol); // ✅ add this
           emitLiveAggregates(mint, ts);
@@ -741,7 +772,7 @@ function connect() {
             last_trade_ts: ts,
           });
 
-          io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+          emitCandleThrottled(mint, candle);
           emitTick(mint, ts, "BUY", priceSol);
           emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
@@ -802,7 +833,7 @@ function connect() {
             last_trade_ts: ts,
           });
 
-          io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+          emitCandleThrottled(mint, candle);
           emitTick(mint, ts, "SELL", priceSol);
           emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
@@ -810,14 +841,22 @@ function connect() {
         }
       }
 
-      // --------------------
-      // broadcast raw events
-      // --------------------
-      const rawEvent = { sig, slot: ctxSlot, eventName, mint, user, payload: JSON.parse(safeJson(payload)) };
-      io.emit("event", rawEvent);
-      io.to("global:events").emit("event", rawEvent);
-      if (mint) io.to(`mint:${mint}:events`).emit("event", rawEvent);
-    }
+        const rawEvent = {
+          sig,
+          slot: ctxSlot,
+          eventName,
+          mint,
+          user,
+          payload: JSON.parse(safeJson(payload)),
+        };
+
+      if (ENABLE_GLOBAL_EVENTS) {
+          io.to("global:events").emit("event", rawEvent);
+      }
+
+      if (mint) {
+           io.to(`mint:${mint}:events`).emit("event", rawEvent);
+      }
   });
 
   ws.on("close", () => {
