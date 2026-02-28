@@ -36,7 +36,8 @@ const SOL_DECIMALS = 1e9;
 const TOKEN_DECIMALS = 1e6; // ✅ you said 6 decimals
 const TOTAL_SUPPLY_TOKENS = 1_000_000_000; // ✅ 1,000,000,000.000000
 const TOTAL_SUPPLY_BASE = TOTAL_SUPPLY_TOKENS * TOKEN_DECIMALS;
-
+const V_SOL = 75.8;           // virtual SOL
+const V_TOK = 526_200_000;    // virtual tokens
 // --------------------
 // Web UI socket server
 // --------------------
@@ -47,6 +48,19 @@ const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } 
 const WS_PORT = Number(process.env.WS_PORT || 3010);
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.get("/simulate-buy", (req, res) => {
+  const mint = req.query.mint;
+  const sol = Number(req.query.sol);
+
+  if (!mint || !sol) {
+    return res.status(400).json({ error: "mint and sol required" });
+  }
+
+  const result = simulateBuy(mint, sol);
+
+  res.json(result);
+});
 
 io.on("connection", (socket) => {
   // join by mint + channel
@@ -80,7 +94,16 @@ io.on("connection", (socket) => {
     if (channel === "candles1m") socket.leave(`mint:${mint}:candles:1m`);
     if (channel === "stats") socket.leave(`mint:${mint}:stats`);
   });
+socket.on("simulateBuy", (msg = {}) => {
+    const mint = msg.mint;
+    const sol = Number(msg.sol);
 
+    if (!mint || !sol) return;
+
+    const result = simulateBuy(mint, sol);
+
+    socket.emit("simulation", result);
+  });
   // optional: allow global streams
   socket.on("joinGlobalPrices", () => socket.join("global:prices"));
   socket.on("joinGlobalEvents", () => socket.join("global:events"));
@@ -245,6 +268,7 @@ function upsertCandle1m(mint, tsSec, priceSol, volSol, volTokens, side) {
   return db.prepare(`SELECT * FROM candles_1m WHERE mint=? AND bucket_ts=?`).get(mint, bucket);
 }
 
+
 function upsertTokenStats(mint, patch) {
   const existing = db.prepare(`SELECT mint FROM token_stats WHERE mint=?`).get(mint);
   const fields = Object.keys(patch);
@@ -281,6 +305,52 @@ function cleanup() {
     if (pingInterval) clearInterval(pingInterval);
   } catch {}
   pingInterval = null;
+}
+
+function simulateBuy(mint, solInput) {
+  const stats = db.prepare(`
+    SELECT tokens_sold_total
+    FROM token_stats
+    WHERE mint=?
+  `).get(mint);
+
+  const tokensSold = stats?.tokens_sold_total
+    ? Number(stats.tokens_sold_total) / TOKEN_DECIMALS
+    : 0;
+
+  const virtualSol = V_SOL + tokensSold;
+  const virtualTok = Math.max(1, V_TOK - tokensSold);
+
+  const k = virtualSol * virtualTok;
+
+  const newSol = virtualSol + solInput;
+  const newTok = k / newSol;
+
+  const tokensOut = virtualTok - newTok;
+
+  const priceBefore = virtualSol / virtualTok;
+  const priceAfter = newSol / newTok;
+
+  const solUsd = getPrice("SOL_USD")?.price || null;
+
+  const priceUsd = solUsd ? priceAfter * solUsd : null;
+
+  const marketcapUsd = priceUsd
+    ? priceUsd * TOTAL_SUPPLY_TOKENS
+    : null;
+
+  const marketcapSol = priceAfter * TOTAL_SUPPLY_TOKENS;
+
+  return {
+    mint,
+    solInput,
+    tokensOut,
+    priceBefore,
+    priceAfter,
+    priceUsd,
+    marketcapUsd,
+    marketcapSol
+  };
 }
 
 function connect() {
