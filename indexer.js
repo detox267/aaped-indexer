@@ -191,24 +191,27 @@ io.on("connection", (socket) => {
   });
 
   socket.on("leave", (msg = {}) => {
-    if (msg.room && typeof msg.room === "string") {
-      socket.leave(msg.room);
-      return;
-    }
-    const mint = typeof msg.mint === "string" ? msg.mint : null;
-    const channel = typeof msg.channel === "string" ? msg.channel : "events";
-    if (!mint) return;
+  if (msg.room && typeof msg.room === "string") {
+    socket.leave(msg.room);
+    return;
+  }
 
-    if (channel === "events") socket.leave(`mint:${mint}:events`);
-    if (channel === "trades") socket.leave(`mint:${mint}:trades`);
-    if (channel === "candles1m") socket.leave(`mint:${mint}:candles:1m`);
-    if (channel.startsWith("candles:")) {
-    if (channel.startsWith("candles:")) {
-      const tf = normalizeTf(channel.split(":")[1]);
-      if (tf) socket.leave(`mint:${mint}:candles:${tf}`);
-    }
-    if (channel === "stats") socket.leave(`mint:${mint}:stats`);
-  });
+  const mint = typeof msg.mint === "string" ? msg.mint : null;
+  const channel = typeof msg.channel === "string" ? msg.channel : "events";
+  if (!mint) return;
+
+  if (channel === "events") socket.leave(`mint:${mint}:events`);
+  if (channel === "trades") socket.leave(`mint:${mint}:trades`);
+  if (channel === "candles1m") socket.leave(`mint:${mint}:candles:1m`);
+
+  if (channel.startsWith("candles:")) {
+    const tf = normalizeTf(channel.split(":")[1]);
+    if (tf) socket.leave(`mint:${mint}:candles:${tf}`);
+  }
+
+  if (channel === "stats") socket.leave(`mint:${mint}:stats`);
+});
+  
 socket.on("simulateBuy", (msg = {}) => {
     const mint = msg.mint;
     const sol = Number(msg.sol);
