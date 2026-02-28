@@ -188,6 +188,7 @@ io.on("connection", (socket) => {
       if (tf) socket.join(`mint:${mint}:candles:${tf}`);
     }
     if (channel === "stats") socket.join(`mint:${mint}:stats`);
+    if (channel === "ticks") socket.join(`mint:${mint}:ticks`);
   });
 
   socket.on("leave", (msg = {}) => {
@@ -210,6 +211,7 @@ io.on("connection", (socket) => {
   }
 
   if (channel === "stats") socket.leave(`mint:${mint}:stats`);
+  if (channel === "ticks") socket.leave(`mint:${mint}:ticks`);
 });
   
 socket.on("simulateBuy", (msg = {}) => {
@@ -320,6 +322,23 @@ function computeTradePriceSol({ side, solLamportsStr, tokenBaseStr }) {
   if (tokens <= 0) return null;
 
   return sol / tokens; // SOL per 1 token
+}
+
+function emitTick(mint, ts, side, priceSol) {
+  if (!mint || !priceSol) return;
+
+  const solUsd = getPrice("SOL_USD")?.price || null;
+  const priceUsd = solUsd ? priceSol * solUsd : null;
+
+  const tick = {
+    mint,
+    ts,
+    side,
+    price_sol: priceSol,
+    price_usd: priceUsd,
+  };
+
+  io.to(`mint:${mint}:ticks`).emit("tick", tick);
 }
 
 function upsertCandle1m(mint, tsSec, priceSol, volSol, volTokens, side) {
@@ -661,6 +680,8 @@ function connect() {
 
           const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "DEVBUY");
           io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+
+          emitTick(mint, ts, "DEVBUY", priceSol); // ✅ add this
           emitLiveAggregates(mint, ts);
         }
       }
@@ -720,6 +741,7 @@ function connect() {
           });
 
           io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+          emitTick(mint, ts, "BUY", priceSol);
           emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
           io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "BUY", priceSol, ts });
@@ -780,6 +802,7 @@ function connect() {
           });
 
           io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
+          emitTick(mint, ts, "SELL", priceSol);
           emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
           io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "SELL", priceSol, ts });
