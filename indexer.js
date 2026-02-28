@@ -510,6 +510,15 @@ function emitLiveAggregates(mint, tsSec) {
   }
 }
 
+function safeObj(v) {
+  return JSON.parse(JSON.stringify(v, (_, val) => {
+    if (val && typeof val === "object") {
+      if (typeof val.toBase58 === "function") return val.toBase58();
+      if (val.constructor && val.constructor.name === "BN") return val.toString();
+    }
+    return val;
+  }));
+}
 
 function upsertTokenStats(mint, patch) {
   const existing = db.prepare(`SELECT mint FROM token_stats WHERE mint=?`).get(mint);
@@ -847,7 +856,7 @@ function connect() {
           eventName,
           mint,
           user,
-          payload: JSON.parse(safeJson(payload)),
+          payload: safeObj(payload),
         };
 
       if (ENABLE_GLOBAL_EVENTS) {
