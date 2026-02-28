@@ -15,6 +15,7 @@ db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
 db.pragma("cache_size = -200000"); // ~200MB memory cache
 db.pragma("temp_store = MEMORY");
+db.pragma("busy_timeout = 5000");
 
 // --------------------
 // schema
