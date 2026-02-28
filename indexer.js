@@ -62,6 +62,37 @@ app.get("/simulate-buy", (req, res) => {
   res.json(result);
 });
 
+app.get("/candles", (req, res) => {
+  const mint = req.query.mint;
+  const interval = req.query.interval || "1m";
+  const limit = Number(req.query.limit || 500);
+
+  if (!mint) {
+    return res.status(400).json({ error: "mint required" });
+  }
+
+  if (interval !== "1m") {
+    return res.status(400).json({ error: "only 1m supported for now" });
+  }
+
+  const rows = db.prepare(`
+    SELECT
+      bucket_ts,
+      open_sol,
+      high_sol,
+      low_sol,
+      close_sol,
+      volume_sol,
+      volume_tokens
+    FROM candles_1m
+    WHERE mint = ?
+    ORDER BY bucket_ts DESC
+    LIMIT ?
+  `).all(mint, limit);
+
+  res.json(rows.reverse());
+});
+
 io.on("connection", (socket) => {
   // join by mint + channel
   // { mint, channel: "events"|"trades"|"candles1m"|"stats" } OR { room: "global:prices" }
