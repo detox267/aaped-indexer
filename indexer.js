@@ -38,6 +38,21 @@ const TOTAL_SUPPLY_TOKENS = 1_000_000_000; // ✅ 1,000,000,000.000000
 const TOTAL_SUPPLY_BASE = TOTAL_SUPPLY_TOKENS * TOKEN_DECIMALS;
 const V_SOL = 75.8;           // virtual SOL
 const V_TOK = 526_200_000;    // virtual tokens
+
+const TF_SECONDS = {
+  "1m": 60,
+  "5m": 300,
+  "15m": 900,
+  "30m": 1800,
+  "1h": 3600,
+  "4h": 14400,
+  "1d": 86400,
+};
+
+function normalizeTf(tf) {
+  const key = String(tf || "1m").toLowerCase();
+  return TF_SECONDS[key] ? key : null;
+}
 // --------------------
 // Web UI socket server
 // --------------------
@@ -64,31 +79,89 @@ app.get("/simulate-buy", (req, res) => {
 
 app.get("/candles", (req, res) => {
   const mint = req.query.mint;
-  const interval = req.query.interval || "1m";
-  const limit = Number(req.query.limit || 500);
+  const tf = normalizeTf(req.query.interval || "1m");
+  const limit = Math.min(5000, Math.max(1, Number(req.query.limit || 500)));
+  const since = req.query.since ? Number(req.query.since) : null; // unix seconds
 
-  if (!mint) {
-    return res.status(400).json({ error: "mint required" });
+  if (!mint) return res.status(400).json({ error: "mint required" });
+  if (!tf) return res.status(400).json({ error: "invalid interval. use 1m,5m,15m,30m,1h,4h,1d" });
+
+  // 1m = direct read
+  if (tf === "1m") {
+    const rows = db.prepare(`
+      SELECT
+        bucket_ts,
+        open_sol,
+        high_sol,
+        low_sol,
+        close_sol,
+        volume_sol,
+        volume_tokens,
+        trades_count,
+        buys_count,
+        sells_count
+      FROM candles_1m
+      WHERE mint = ?
+        AND (? IS NULL OR bucket_ts >= ?)
+      ORDER BY bucket_ts DESC
+      LIMIT ?
+    `).all(mint, since, since, limit);
+
+    return res.json(rows.reverse());
   }
 
-  if (interval !== "1m") {
-    return res.status(400).json({ error: "only 1m supported for now" });
-  }
+  const step = TF_SECONDS[tf];
 
+  // Derived aggregation from 1m using window functions
   const rows = db.prepare(`
-    SELECT
-      bucket_ts,
-      open_sol,
-      high_sol,
-      low_sol,
-      close_sol,
-      volume_sol,
-      volume_tokens
-    FROM candles_1m
-    WHERE mint = ?
+    WITH base AS (
+      SELECT
+        mint,
+        bucket_ts,
+        (bucket_ts / ?) * ? AS tf_bucket,
+        open_sol, high_sol, low_sol, close_sol,
+        volume_sol, volume_tokens,
+        trades_count, buys_count, sells_count
+      FROM candles_1m
+      WHERE mint = ?
+        AND (? IS NULL OR bucket_ts >= ?)
+    ),
+    ranked AS (
+      SELECT
+        tf_bucket,
+        open_sol,
+        close_sol,
+        high_sol,
+        low_sol,
+        volume_sol,
+        volume_tokens,
+        trades_count,
+        buys_count,
+        sells_count,
+        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts ASC)  AS rn_open,
+        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts DESC) AS rn_close
+      FROM base
+    ),
+    agg AS (
+      SELECT
+        tf_bucket AS bucket_ts,
+        MAX(CASE WHEN rn_open = 1 THEN open_sol END)  AS open_sol,
+        MAX(high_sol) AS high_sol,
+        MIN(low_sol)  AS low_sol,
+        MAX(CASE WHEN rn_close = 1 THEN close_sol END) AS close_sol,
+        SUM(volume_sol)    AS volume_sol,
+        SUM(volume_tokens) AS volume_tokens,
+        SUM(trades_count)  AS trades_count,
+        SUM(buys_count)    AS buys_count,
+        SUM(sells_count)   AS sells_count
+      FROM ranked
+      GROUP BY tf_bucket
+    )
+    SELECT *
+    FROM agg
     ORDER BY bucket_ts DESC
     LIMIT ?
-  `).all(mint, limit);
+  `).all(step, step, mint, since, since, limit);
 
   res.json(rows.reverse());
 });
@@ -108,6 +181,10 @@ io.on("connection", (socket) => {
     if (channel === "events") socket.join(`mint:${mint}:events`);
     if (channel === "trades") socket.join(`mint:${mint}:trades`);
     if (channel === "candles1m") socket.join(`mint:${mint}:candles:1m`);
+    if (channel.startsWith("candles:")) {
+      const tf = normalizeTf(channel.split(":")[1]);
+      if (tf) socket.join(`mint:${mint}:candles:${tf}`);
+    }
     if (channel === "stats") socket.join(`mint:${mint}:stats`);
   });
 
@@ -123,6 +200,10 @@ io.on("connection", (socket) => {
     if (channel === "events") socket.leave(`mint:${mint}:events`);
     if (channel === "trades") socket.leave(`mint:${mint}:trades`);
     if (channel === "candles1m") socket.leave(`mint:${mint}:candles:1m`);
+    if (channel.startsWith("candles:")) {
+      const tf = normalizeTf(channel.split(":")[1]);
+      if (tf) socket.leave(`mint:${mint}:candles:${tf}`);
+        }
     if (channel === "stats") socket.leave(`mint:${mint}:stats`);
   });
 socket.on("simulateBuy", (msg = {}) => {
@@ -297,6 +378,69 @@ function upsertCandle1m(mint, tsSec, priceSol, volSol, volTokens, side) {
   );
 
   return db.prepare(`SELECT * FROM candles_1m WHERE mint=? AND bucket_ts=?`).get(mint, bucket);
+}
+
+// --------------------
+// live aggregated candle emission (derived TFs)
+// --------------------
+const LIVE_TFS = ["5m", "15m", "30m", "1h", "4h", "1d"];
+
+function getAggCandleForBucket(mint, tf, tsSec) {
+  const step = TF_SECONDS[tf];
+  const tfBucket = Math.floor(tsSec / step) * step;
+
+  const row = db.prepare(`
+    WITH base AS (
+      SELECT
+        bucket_ts,
+        (bucket_ts / ?) * ? AS tf_bucket,
+        open_sol, high_sol, low_sol, close_sol,
+        volume_sol, volume_tokens,
+        trades_count, buys_count, sells_count
+      FROM candles_1m
+      WHERE mint = ?
+        AND bucket_ts >= ?
+        AND bucket_ts <  ?
+    ),
+    ranked AS (
+      SELECT
+        tf_bucket,
+        open_sol,
+        close_sol,
+        high_sol,
+        low_sol,
+        volume_sol,
+        volume_tokens,
+        trades_count, buys_count, sells_count,
+        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts ASC)  AS rn_open,
+        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts DESC) AS rn_close
+      FROM base
+    )
+    SELECT
+      tf_bucket AS bucket_ts,
+      MAX(CASE WHEN rn_open = 1 THEN open_sol END)  AS open_sol,
+      MAX(high_sol) AS high_sol,
+      MIN(low_sol)  AS low_sol,
+      MAX(CASE WHEN rn_close = 1 THEN close_sol END) AS close_sol,
+      SUM(volume_sol)    AS volume_sol,
+      SUM(volume_tokens) AS volume_tokens,
+      SUM(trades_count)  AS trades_count,
+      SUM(buys_count)    AS buys_count,
+      SUM(sells_count)   AS sells_count
+    FROM ranked
+    WHERE tf_bucket = ?
+    GROUP BY tf_bucket
+  `).get(step, step, mint, tfBucket, tfBucket + step, tfBucket);
+
+  return row || null;
+}
+
+function emitLiveAggregates(mint, tsSec) {
+  for (const tf of LIVE_TFS) {
+    const agg = getAggCandleForBucket(mint, tf, tsSec);
+    if (!agg) continue;
+    io.to(`mint:${mint}:candles:${tf}`).emit("candle", { tf, ...agg });
+  }
 }
 
 
@@ -501,6 +645,7 @@ function connect() {
 
           const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "DEVBUY");
           io.to(`mint:${mint}:candles:1m`).emit("candle1m", candle);
+          emitLiveAggregates(mint, ts);
         }
       }
 
@@ -559,6 +704,7 @@ function connect() {
           });
 
           io.to(`mint:${mint}:candles:1m`).emit("candle1m", candle);
+          emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
           io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "BUY", priceSol, ts });
         }
@@ -618,6 +764,7 @@ function connect() {
           });
 
           io.to(`mint:${mint}:candles:1m`).emit("candle1m", candle);
+          emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
           io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "SELL", priceSol, ts });
         }
