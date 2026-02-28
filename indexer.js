@@ -19,6 +19,7 @@ const {
   now,
 } = require("./db");
 
+const fetch = globalThis.fetch || require("node-fetch");
 const PROGRAM_ID = process.env.PROGRAM_ID;
 const IDL_PATH = process.env.IDL_PATH;
 
