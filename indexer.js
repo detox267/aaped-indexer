@@ -856,6 +856,7 @@ function connect() {
 
       if (mint) {
            io.to(`mint:${mint}:events`).emit("event", rawEvent);
+       }
       }
   });
 
