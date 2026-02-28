@@ -77,6 +77,8 @@ app.get("/simulate-buy", (req, res) => {
   res.json(result);
 });
 
+const lastAggEmit = new Map(); // key = `${mint}:${tf}` -> tf_bucket_ts
+
 app.get("/candles", (req, res) => {
   const mint = req.query.mint;
   const tf = normalizeTf(req.query.interval || "1m");
@@ -201,9 +203,10 @@ io.on("connection", (socket) => {
     if (channel === "trades") socket.leave(`mint:${mint}:trades`);
     if (channel === "candles1m") socket.leave(`mint:${mint}:candles:1m`);
     if (channel.startsWith("candles:")) {
+    if (channel.startsWith("candles:")) {
       const tf = normalizeTf(channel.split(":")[1]);
       if (tf) socket.leave(`mint:${mint}:candles:${tf}`);
-        }
+    }
     if (channel === "stats") socket.leave(`mint:${mint}:stats`);
   });
 socket.on("simulateBuy", (msg = {}) => {
@@ -437,6 +440,16 @@ function getAggCandleForBucket(mint, tf, tsSec) {
 
 function emitLiveAggregates(mint, tsSec) {
   for (const tf of LIVE_TFS) {
+    const step = TF_SECONDS[tf];
+    const tfBucket = Math.floor(tsSec / step) * step;
+
+    const key = `${mint}:${tf}`;
+    const prev = lastAggEmit.get(key);
+
+    // only recompute/emit once per tf-bucket (reduces spam)
+    if (prev === tfBucket) continue;
+    lastAggEmit.set(key, tfBucket);
+
     const agg = getAggCandleForBucket(mint, tf, tsSec);
     if (!agg) continue;
     io.to(`mint:${mint}:candles:${tf}`).emit("candle", { tf, ...agg });
@@ -644,7 +657,7 @@ function connect() {
           const volTok = (Number(tokBase) / TOKEN_DECIMALS);
 
           const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "DEVBUY");
-          io.to(`mint:${mint}:candles:1m`).emit("candle1m", candle);
+          io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
           emitLiveAggregates(mint, ts);
         }
       }
@@ -703,7 +716,7 @@ function connect() {
             last_trade_ts: ts,
           });
 
-          io.to(`mint:${mint}:candles:1m`).emit("candle1m", candle);
+          io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
           emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
           io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "BUY", priceSol, ts });
@@ -763,7 +776,7 @@ function connect() {
             last_trade_ts: ts,
           });
 
-          io.to(`mint:${mint}:candles:1m`).emit("candle1m", candle);
+          io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
           emitLiveAggregates(mint, ts);
           io.to(`mint:${mint}:stats`).emit("stats", stats);
           io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "SELL", priceSol, ts });
