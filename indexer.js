@@ -850,24 +850,23 @@ function connect() {
         }
       }
 
-        const rawEvent = {
-          sig,
-          slot: ctxSlot,
-          eventName,
-          mint,
-          user,
-          payload: safeObj(payload),
-        };
+      const rawEvent = {
+        sig,
+        slot: ctxSlot,
+        eventName,
+        mint,
+        user,
+        payload: safeObj(payload),
+      };
 
       if (ENABLE_GLOBAL_EVENTS) {
-          io.to("global:events").emit("event", rawEvent);
+        io.to("global:events").emit("event", rawEvent);
       }
-
       if (mint) {
-           io.to(`mint:${mint}:events`).emit("event", rawEvent);
-       }
+        io.to(`mint:${mint}:events`).emit("event", rawEvent);
       }
-  });
+    } // <-- closes: for (const line of logs)
+  });  // <-- closes: ws.on("message")
 
   ws.on("close", () => {
     console.log("Helius WS closed. Reconnecting...");
