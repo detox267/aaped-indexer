@@ -12,6 +12,22 @@ const { startIndexer } = require("./indexer");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+app.use((req, res, next) => {
+  const allowed = ["https://aaped.fun", "https://www.aaped.fun"];
+  const origin = req.headers.origin;
+
+  if (allowed.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
