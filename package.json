@@ -1,17 +1,20 @@
 {
-  "name": "aaped-indexer",
+  "name": "moonz-indexer",
   "version": "1.0.0",
-  "description": "AAPED Launch Indexer (Helius -> SQLite -> Websocket)",
-  "main": "indexer.js",
+  "description": "Moonz/AAPED Launch Indexer for launch state, trades, candles, stats and sockets",
+  "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node indexer.js"
+    "start": "node server.js",
+    "indexer": "node indexer.js"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.30.1",
-    "better-sqlite3": "^9.4.0",
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.95.0",
+    "better-sqlite3": "^11.0.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
     "socket.io": "^4.7.5",
     "ws": "^8.17.0"
   }
