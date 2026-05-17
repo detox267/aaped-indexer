@@ -1,882 +1,1049 @@
-// indexer.js
 require("dotenv").config();
 
-const fs = require("fs");
 const WebSocket = require("ws");
 const anchor = require("@coral-xyz/anchor");
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-
+const { Connection, PublicKey } = require("@solana/web3.js");
+const { loadIdl } = require("./idl");
+const { makeEventDecoder } = require("./anchorDecode");
 const {
   db,
+  now,
   hasSeenTx,
   markTxSeen,
-  upsertLaunch,
-  insertTrade,
   setPrice,
   getPrice,
-  now,
+  upsertLaunch,
+  upsertTokenStats,
+  insertEvent,
+  insertTrade,
+  upsertCandle1m,
+  refresh24hVolume,
+  getToken,
 } = require("./db");
 
 const fetch = globalThis.fetch || require("node-fetch");
+
 const PROGRAM_ID = process.env.PROGRAM_ID;
-const IDL_PATH = process.env.IDL_PATH;
+const RPC_URL = process.env.RPC_URL;
+const HELIUS_WSS =
+  process.env.HELIUS_WSS ||
+  (process.env.HELIUS_API_KEY
+    ? `wss://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`
+    : null);
 
 if (!PROGRAM_ID) throw new Error("Missing PROGRAM_ID");
-if (!IDL_PATH) throw new Error("Missing IDL_PATH");
-if (!fs.existsSync(IDL_PATH)) throw new Error(`IDL_PATH not found: ${IDL_PATH}`);
+if (!RPC_URL) throw new Error("Missing RPC_URL");
+if (!HELIUS_WSS) throw new Error("Missing HELIUS_WSS or HELIUS_API_KEY");
 
-const idl = JSON.parse(fs.readFileSync(IDL_PATH, "utf8"));
-const coder = new anchor.BorshCoder(idl);
+const PROGRAM_PK = new PublicKey(PROGRAM_ID);
+const connection = new Connection(RPC_URL, { commitment: "confirmed" });
+const idl = loadIdl();
+const decodeEventsFromLogs = makeEventDecoder(idl);
 
-// --------------------
-// constants (your setup)
-// --------------------
-const SOL_DECIMALS = 1e9;
-const TOKEN_DECIMALS = 1e6; // ✅ you said 6 decimals
-const TOTAL_SUPPLY_TOKENS = 1_000_000_000; // ✅ 1,000,000,000.000000
-const TOTAL_SUPPLY_BASE = TOTAL_SUPPLY_TOKENS * TOKEN_DECIMALS;
-const V_SOL = 75.8;           // virtual SOL
-const V_TOK = 526_200_000;    // virtual tokens
+const TOKEN_DECIMALS = Number(process.env.TOKEN_DECIMALS || 6);
+const TOKEN_SCALE = 10 ** TOKEN_DECIMALS;
+const SOL_DECIMALS = 9;
+const LAMPORTS_PER_SOL = 1_000_000_000;
+
+const TOTAL_SUPPLY_TOKENS = Number(process.env.TOTAL_SUPPLY_TOKENS || 1_000_000_000);
+const SALE_SUPPLY_TOKENS = Number(process.env.SALE_SUPPLY_TOKENS || 650_000_000);
+const LP_SUPPLY_TOKENS = Number(process.env.LP_SUPPLY_TOKENS || 350_000_000);
+
+const TOTAL_SUPPLY_BASE = BigInt(process.env.TOTAL_SUPPLY_BASE || String(TOTAL_SUPPLY_TOKENS * TOKEN_SCALE));
+const SALE_SUPPLY_BASE = BigInt(process.env.SALE_SUPPLY_BASE || String(SALE_SUPPLY_TOKENS * TOKEN_SCALE));
+const LP_SUPPLY_BASE = BigInt(process.env.LP_SUPPLY_BASE || String(LP_SUPPLY_TOKENS * TOKEN_SCALE));
+
+const V_SOL_LAMPORTS = BigInt(process.env.V_SOL_LAMPORTS || String(117 * LAMPORTS_PER_SOL));
+const V_TOK_BASE = BigInt(process.env.V_TOK_BASE || String(760_000_000 * TOKEN_SCALE));
+
+const TRADE_FEE_BPS = Number(process.env.TRADE_FEE_BPS || 125);
+
+const WSOL_MINT = process.env.WSOL_MINT || "So11111111111111111111111111111111111111112";
+const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const PLATFORM_WALLET = process.env.PLATFORM_WALLET || "ELZ5aiHLxnaTmbazgbmoSCVS6SyvJ7DbXTDxq682PuKt";
+
 const ENABLE_GLOBAL_EVENTS = process.env.ENABLE_GLOBAL_EVENTS === "true";
+const STARTUP_BACKFILL_SIGNATURES = Number(process.env.STARTUP_BACKFILL_SIGNATURES || 0);
+const TX_FETCH_RETRIES = Number(process.env.TX_FETCH_RETRIES || 8);
+const TX_FETCH_DELAY_MS = Number(process.env.TX_FETCH_DELAY_MS || 750);
 
-const TF_SECONDS = {
-  "1m": 60,
-  "5m": 300,
-  "15m": 900,
-  "30m": 1800,
-  "1h": 3600,
-  "4h": 14400,
-  "1d": 86400,
+const PHASE_BY_U8 = {
+  0: "pending_dev_buy",
+  1: "bonding",
+  2: "migration_pending",
+  3: "amm_live",
+  4: "migrated",
+  5: "switching",
 };
 
-function normalizeTf(tf) {
-  const key = String(tf || "1m").toLowerCase();
-  return TF_SECONDS[key] ? key : null;
+const QUOTE_BY_U8 = {
+  0: "SOL",
+  1: "USDC",
+};
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
-// --------------------
-// Web UI socket server
-// --------------------
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-const WS_PORT = Number(process.env.WS_PORT || 3010);
+function stringifySafe(value) {
+  return JSON.stringify(value, (_, val) => {
+    if (typeof val === "bigint") return val.toString();
+    if (val && typeof val === "object") {
+      if (typeof val.toBase58 === "function") return val.toBase58();
+      if (val.constructor?.name === "BN") return val.toString();
+    }
+    return val;
+  });
+}
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+function toBase58Maybe(value) {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (typeof value.toBase58 === "function") return value.toBase58();
+  if (value._bn && typeof value.toString === "function") return value.toString();
+  return String(value);
+}
 
-app.get("/simulate-buy", (req, res) => {
-  const mint = req.query.mint;
-  const sol = Number(req.query.sol);
+function toBigIntMaybe(value, fallback = 0n) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number") return BigInt(Math.trunc(value));
+  if (typeof value === "string") {
+    if (!value.trim()) return fallback;
+    return BigInt(value);
+  }
+  if (typeof value.toString === "function") return BigInt(value.toString());
+  return fallback;
+}
 
-  if (!mint || !sol) {
-    return res.status(400).json({ error: "mint and sol required" });
+function bigIntToString(value) {
+  if (value === null || value === undefined) return null;
+  return toBigIntMaybe(value).toString();
+}
+
+function baseToUi(base, decimals = TOKEN_DECIMALS) {
+  const n = Number(toBigIntMaybe(base, 0n));
+  return n / 10 ** decimals;
+}
+
+function quoteBaseToUi(base, quoteAsset) {
+  if (quoteAsset === "USDC") return baseToUi(base, 6);
+  return Number(toBigIntMaybe(base, 0n)) / LAMPORTS_PER_SOL;
+}
+
+function lamportsToSol(lamports) {
+  return Number(toBigIntMaybe(lamports, 0n)) / LAMPORTS_PER_SOL;
+}
+
+function derivePdas(mintStr) {
+  const mint = new PublicKey(mintStr);
+
+  const [launchState] = PublicKey.findProgramAddressSync(
+    [Buffer.from("launch_state"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  const [launchEscrow] = PublicKey.findProgramAddressSync(
+    [Buffer.from("launch_escrow"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  const [escrowSolVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("escrow_sol"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  const [saleVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("sale_vault"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  const [lpVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("lp_vault"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  const [treasuryWsolVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("treasury_wsol"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  const [treasuryUsdcVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("treasury_usdc"), mint.toBuffer()],
+    PROGRAM_PK
+  );
+
+  return {
+    mint: mint.toBase58(),
+    launchState: launchState.toBase58(),
+    launchEscrow: launchEscrow.toBase58(),
+    escrowSolVault: escrowSolVault.toBase58(),
+    saleVault: saleVault.toBase58(),
+    lpVault: lpVault.toBase58(),
+    treasuryWsolVault: treasuryWsolVault.toBase58(),
+    treasuryUsdcVault: treasuryUsdcVault.toBase58(),
+  };
+}
+
+function readPubkey(buf, offset) {
+  return new PublicKey(buf.subarray(offset, offset + 32)).toBase58();
+}
+
+function readU64(buf, offset) {
+  return buf.readBigUInt64LE(offset);
+}
+
+function readI64(buf, offset) {
+  return buf.readBigInt64LE(offset);
+}
+
+function readU128(buf, offset) {
+  let out = 0n;
+  for (let i = 15; i >= 0; i--) {
+    out = (out << 8n) + BigInt(buf[offset + i]);
+  }
+  return out;
+}
+
+function decodeLaunchState(buf) {
+  if (!buf || buf.length < 331) return null;
+
+  let o = 8;
+  const bump = buf.readUInt8(o); o += 1;
+  const treasuryWsolBump = buf.readUInt8(o); o += 1;
+  const treasuryUsdcBump = buf.readUInt8(o); o += 1;
+  const escrowSolBump = buf.readUInt8(o); o += 1;
+  const stateU8 = buf.readUInt8(o); o += 1;
+
+  const mint = readPubkey(buf, o); o += 32;
+  const creator = readPubkey(buf, o); o += 32;
+  const platform = readPubkey(buf, o); o += 32;
+  const coreAuthority = readPubkey(buf, o); o += 32;
+
+  const saleVault = readPubkey(buf, o); o += 32;
+  const lpVault = readPubkey(buf, o); o += 32;
+  const treasuryWsolVault = readPubkey(buf, o); o += 32;
+  const treasuryUsdcVault = readPubkey(buf, o); o += 32;
+  const escrowSolVault = readPubkey(buf, o); o += 32;
+
+  const totalSupply = readU64(buf, o); o += 8;
+  const saleSupply = readU64(buf, o); o += 8;
+  const lpSupply = readU64(buf, o); o += 8;
+
+  const ammInitialSol = readU64(buf, o); o += 8;
+  const ammInitialTok = readU64(buf, o); o += 8;
+  const migratedAt = readI64(buf, o); o += 8;
+
+  const ammType = buf.readUInt8(o); o += 1;
+  const lpShareClaimBase = readU64(buf, o); o += 8;
+
+  const quoteAssetU8 = buf.readUInt8(o); o += 1;
+  const pendingQuoteAssetU8 = buf.readUInt8(o); o += 1;
+  const lastPoolSwitchTs = readI64(buf, o); o += 8;
+  const switchStartedAt = readI64(buf, o); o += 8;
+
+  const feeTotalBps = buf.readUInt16LE(o); o += 2;
+  const feeCreatorBps = buf.readUInt16LE(o); o += 2;
+  const feePlatformBps = buf.readUInt16LE(o); o += 2;
+
+  const tokensSold = readU64(buf, o); o += 8;
+  const solCollected = readU128(buf, o); o += 16;
+
+  const launchTs = readI64(buf, o); o += 8;
+  const lastTradeTs = readI64(buf, o); o += 8;
+
+  const metadata = readPubkey(buf, o); o += 32;
+
+  const devBuyDone = Boolean(buf.readUInt8(o)); o += 1;
+  const escrowSettled = Boolean(buf.readUInt8(o)); o += 1;
+
+  return {
+    bump,
+    treasuryWsolBump,
+    treasuryUsdcBump,
+    escrowSolBump,
+    stateU8,
+    phase: PHASE_BY_U8[stateU8] || "unknown",
+    mint,
+    creator,
+    platform,
+    coreAuthority,
+    saleVault,
+    lpVault,
+    treasuryWsolVault,
+    treasuryUsdcVault,
+    escrowSolVault,
+    totalSupply,
+    saleSupply,
+    lpSupply,
+    ammInitialSol,
+    ammInitialTok,
+    migratedAt,
+    ammType,
+    lpShareClaimBase,
+    quoteAssetU8,
+    quoteAsset: QUOTE_BY_U8[quoteAssetU8] || "UNKNOWN",
+    pendingQuoteAssetU8,
+    pendingQuoteAsset: QUOTE_BY_U8[pendingQuoteAssetU8] || "UNKNOWN",
+    lastPoolSwitchTs,
+    switchStartedAt,
+    feeTotalBps,
+    feeCreatorBps,
+    feePlatformBps,
+    tokensSold,
+    solCollected,
+    launchTs,
+    lastTradeTs,
+    metadata,
+    devBuyDone,
+    escrowSettled,
+  };
+}
+
+function decodeTokenAccountAmount(buf) {
+  if (!buf || buf.length < 72) return 0n;
+  return buf.readBigUInt64LE(64);
+}
+
+function quoteMintForAsset(quoteAsset) {
+  return quoteAsset === "USDC" ? USDC_MINT : WSOL_MINT;
+}
+
+function calculateStatsFromState(state, balances, solUsd) {
+  const phase = state.phase;
+  const quoteAsset = state.quoteAsset;
+
+  const totalSupply = state.totalSupply || TOTAL_SUPPLY_BASE;
+  const saleSupply = state.saleSupply || SALE_SUPPLY_BASE;
+  const lpSupply = state.lpSupply || LP_SUPPLY_BASE;
+  const tokensSold = state.tokensSold || 0n;
+  const tokensRemaining = saleSupply > tokensSold ? saleSupply - tokensSold : 0n;
+
+  let priceQuote = null;
+  let priceSol = null;
+  let priceUsd = null;
+
+  if (phase === "bonding" || phase === "pending_dev_buy" || phase === "migration_pending") {
+    const quoteReserve = V_SOL_LAMPORTS + (state.solCollected || 0n);
+    const tokenReserve = V_TOK_BASE + tokensRemaining;
+
+    if (quoteReserve > 0n && tokenReserve > 0n) {
+      priceSol = lamportsToSol(quoteReserve) / baseToUi(tokenReserve);
+      priceQuote = priceSol;
+      priceUsd = solUsd ? priceSol * solUsd : null;
+    }
+  } else if (phase === "amm_live" || phase === "switching" || phase === "migrated") {
+    const tokenReserve = balances.lpVaultAmount || 0n;
+    const quoteReserve = quoteAsset === "USDC" ? (balances.treasuryUsdcAmount || 0n) : (balances.treasuryWsolAmount || 0n);
+
+    if (quoteReserve > 0n && tokenReserve > 0n) {
+      priceQuote = quoteBaseToUi(quoteReserve, quoteAsset) / baseToUi(tokenReserve);
+      priceSol = quoteAsset === "USDC" && solUsd ? priceQuote / solUsd : priceQuote;
+      priceUsd = quoteAsset === "USDC" ? priceQuote : solUsd ? priceSol * solUsd : null;
+    }
   }
 
-  const result = simulateBuy(mint, sol);
+  const totalSupplyUi = baseToUi(totalSupply);
+  const marketcapQuote = priceQuote == null ? null : priceQuote * totalSupplyUi;
+  const marketcapSol = priceSol == null ? null : priceSol * totalSupplyUi;
+  const marketcapUsd = priceUsd == null ? null : priceUsd * totalSupplyUi;
 
-  res.json(result);
-});
+  const bondingProgress = Number(saleSupply || 0n) > 0
+    ? Math.max(0, Math.min(100, (baseToUi(tokensSold) / baseToUi(saleSupply)) * 100))
+    : 0;
 
-const lastAggEmit = new Map(); // key = `${mint}:${tf}` -> tf_bucket_ts
+  return {
+    priceQuote,
+    priceSol,
+    priceUsd,
+    marketcapQuote,
+    marketcapSol,
+    marketcapUsd,
+    totalSupply,
+    saleSupply,
+    lpSupply,
+    tokensSold,
+    tokensRemaining,
+    bondingProgress,
+  };
+}
 
-app.get("/candles", (req, res) => {
-  const mint = req.query.mint;
-  const tf = normalizeTf(req.query.interval || "1m");
-  const limit = Math.min(5000, Math.max(1, Number(req.query.limit || 500)));
-  const since = req.query.since ? Number(req.query.since) : null; // unix seconds
+async function refreshMintState(mint, io = null) {
+  const pdas = derivePdas(mint);
 
-  if (!mint) return res.status(400).json({ error: "mint required" });
-  if (!tf) return res.status(400).json({ error: "invalid interval. use 1m,5m,15m,30m,1h,4h,1d" });
+  const keys = [
+    pdas.launchState,
+    pdas.saleVault,
+    pdas.lpVault,
+    pdas.treasuryWsolVault,
+    pdas.treasuryUsdcVault,
+  ].map((x) => new PublicKey(x));
 
-  // 1m = direct read
-  if (tf === "1m") {
-    const rows = db.prepare(`
-      SELECT
-        bucket_ts,
-        open_sol,
-        high_sol,
-        low_sol,
-        close_sol,
-        volume_sol,
-        volume_tokens,
-        trades_count,
-        buys_count,
-        sells_count
-      FROM candles_1m
-      WHERE mint = ?
-        AND (? IS NULL OR bucket_ts >= ?)
-      ORDER BY bucket_ts DESC
-      LIMIT ?
-    `).all(mint, since, since, limit);
+  const infos = await connection.getMultipleAccountsInfo(keys, "confirmed");
+  const launchInfo = infos[0];
+  if (!launchInfo) return null;
 
-    return res.json(rows.reverse());
-  }
+  const state = decodeLaunchState(launchInfo.data);
+  if (!state) return null;
 
-  const step = TF_SECONDS[tf];
+  const balances = {
+    saleVaultAmount: decodeTokenAccountAmount(infos[1]?.data),
+    lpVaultAmount: decodeTokenAccountAmount(infos[2]?.data),
+    treasuryWsolAmount: decodeTokenAccountAmount(infos[3]?.data),
+    treasuryUsdcAmount: decodeTokenAccountAmount(infos[4]?.data),
+  };
 
-  // Derived aggregation from 1m using window functions
-  const rows = db.prepare(`
-    WITH base AS (
-      SELECT
-        mint,
-        bucket_ts,
-        (bucket_ts / ?) * ? AS tf_bucket,
-        open_sol, high_sol, low_sol, close_sol,
-        volume_sol, volume_tokens,
-        trades_count, buys_count, sells_count
-      FROM candles_1m
-      WHERE mint = ?
-        AND (? IS NULL OR bucket_ts >= ?)
-    ),
-    ranked AS (
-      SELECT
-        tf_bucket,
-        open_sol,
-        close_sol,
-        high_sol,
-        low_sol,
-        volume_sol,
-        volume_tokens,
-        trades_count,
-        buys_count,
-        sells_count,
-        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts ASC)  AS rn_open,
-        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts DESC) AS rn_close
-      FROM base
-    ),
-    agg AS (
-      SELECT
-        tf_bucket AS bucket_ts,
-        MAX(CASE WHEN rn_open = 1 THEN open_sol END)  AS open_sol,
-        MAX(high_sol) AS high_sol,
-        MIN(low_sol)  AS low_sol,
-        MAX(CASE WHEN rn_close = 1 THEN close_sol END) AS close_sol,
-        SUM(volume_sol)    AS volume_sol,
-        SUM(volume_tokens) AS volume_tokens,
-        SUM(trades_count)  AS trades_count,
-        SUM(buys_count)    AS buys_count,
-        SUM(sells_count)   AS sells_count
-      FROM ranked
-      GROUP BY tf_bucket
-    )
-    SELECT *
-    FROM agg
-    ORDER BY bucket_ts DESC
-    LIMIT ?
-  `).all(step, step, mint, since, since, limit);
+  const solUsd = getPrice("SOL_USD")?.price || null;
+  const computed = calculateStatsFromState(state, balances, solUsd);
 
-  res.json(rows.reverse());
-});
-
-io.on("connection", (socket) => {
-  // join by mint + channel
-  // { mint, channel: "events"|"trades"|"candles1m"|"stats" } OR { room: "global:prices" }
-  socket.on("join", (msg = {}) => {
-    if (msg.room && typeof msg.room === "string") {
-      socket.join(msg.room);
-      return;
-    }
-    const mint = typeof msg.mint === "string" ? msg.mint : null;
-    const channel = typeof msg.channel === "string" ? msg.channel : "events";
-    if (!mint) return;
-
-    if (channel === "events") socket.join(`mint:${mint}:events`);
-    if (channel === "trades") socket.join(`mint:${mint}:trades`);
-    if (channel === "candles1m") socket.join(`mint:${mint}:candles:1m`);
-    if (channel.startsWith("candles:")) {
-      const tf = normalizeTf(channel.split(":")[1]);
-      if (tf) socket.join(`mint:${mint}:candles:${tf}`);
-    }
-    if (channel === "stats") socket.join(`mint:${mint}:stats`);
-    if (channel === "ticks") socket.join(`mint:${mint}:ticks`);
+  upsertLaunch(mint, {
+    launch_state: pdas.launchState,
+    launch_escrow: pdas.launchEscrow,
+    escrow_sol_vault: state.escrowSolVault || pdas.escrowSolVault,
+    sale_vault: state.saleVault || pdas.saleVault,
+    lp_vault: state.lpVault || pdas.lpVault,
+    treasury_wsol_vault: state.treasuryWsolVault || pdas.treasuryWsolVault,
+    treasury_usdc_vault: state.treasuryUsdcVault || pdas.treasuryUsdcVault,
+    metadata: state.metadata,
+    creator: state.creator,
+    platform: state.platform,
+    core_authority: state.coreAuthority,
+    total_supply: bigIntToString(state.totalSupply),
+    sale_supply: bigIntToString(state.saleSupply),
+    lp_supply: bigIntToString(state.lpSupply),
+    decimals: TOKEN_DECIMALS,
+    state_u8: state.stateU8,
+    phase: state.phase,
+    quote_asset_u8: state.quoteAssetU8,
+    quote_asset: state.quoteAsset,
+    pending_quote_asset_u8: state.pendingQuoteAssetU8,
+    pending_quote_asset: state.pendingQuoteAsset,
+    tokens_sold: bigIntToString(state.tokensSold),
+    sol_collected: bigIntToString(state.solCollected),
+    amm_initial_sol: bigIntToString(state.ammInitialSol),
+    amm_initial_tok: bigIntToString(state.ammInitialTok),
+    migrated_at: Number(state.migratedAt || 0n),
+    launch_ts: Number(state.launchTs || 0n),
+    last_trade_ts: Number(state.lastTradeTs || 0n),
+    last_pool_switch_ts: Number(state.lastPoolSwitchTs || 0n),
+    switch_started_at: Number(state.switchStartedAt || 0n),
+    dev_buy_done: state.devBuyDone ? 1 : 0,
+    escrow_settled: state.escrowSettled ? 1 : 0,
+    sale_vault_amount: bigIntToString(balances.saleVaultAmount),
+    lp_vault_amount: bigIntToString(balances.lpVaultAmount),
+    treasury_wsol_amount: bigIntToString(balances.treasuryWsolAmount),
+    treasury_usdc_amount: bigIntToString(balances.treasuryUsdcAmount),
   });
 
-  socket.on("leave", (msg = {}) => {
-  if (msg.room && typeof msg.room === "string") {
-    socket.leave(msg.room);
-    return;
-  }
-
-  const mint = typeof msg.mint === "string" ? msg.mint : null;
-  const channel = typeof msg.channel === "string" ? msg.channel : "events";
-  if (!mint) return;
-
-  if (channel === "events") socket.leave(`mint:${mint}:events`);
-  if (channel === "trades") socket.leave(`mint:${mint}:trades`);
-  if (channel === "candles1m") socket.leave(`mint:${mint}:candles:1m`);
-
-  if (channel.startsWith("candles:")) {
-    const tf = normalizeTf(channel.split(":")[1]);
-    if (tf) socket.leave(`mint:${mint}:candles:${tf}`);
-  }
-
-  if (channel === "stats") socket.leave(`mint:${mint}:stats`);
-  if (channel === "ticks") socket.leave(`mint:${mint}:ticks`);
-});
-  
-socket.on("simulateBuy", (msg = {}) => {
-    const mint = msg.mint;
-    const sol = Number(msg.sol);
-
-    if (!mint || !sol) return;
-
-    const result = simulateBuy(mint, sol);
-
-    socket.emit("simulation", result);
+  const stats = upsertTokenStats(mint, {
+    phase: state.phase,
+    phase_u8: state.stateU8,
+    quote_asset: state.quoteAsset,
+    quote_asset_u8: state.quoteAssetU8,
+    price_quote: computed.priceQuote,
+    price_sol: computed.priceSol,
+    price_usd: computed.priceUsd,
+    marketcap_quote: computed.marketcapQuote,
+    marketcap_sol: computed.marketcapSol,
+    marketcap_usd: computed.marketcapUsd,
+    total_supply: bigIntToString(computed.totalSupply),
+    sale_supply: bigIntToString(computed.saleSupply),
+    lp_supply: bigIntToString(computed.lpSupply),
+    tokens_sold: bigIntToString(computed.tokensSold),
+    tokens_remaining: bigIntToString(computed.tokensRemaining),
+    bonding_progress: computed.bondingProgress,
+    sale_vault: state.saleVault,
+    lp_vault: state.lpVault,
+    treasury_wsol_vault: state.treasuryWsolVault,
+    treasury_usdc_vault: state.treasuryUsdcVault,
+    sale_vault_amount: bigIntToString(balances.saleVaultAmount),
+    lp_vault_amount: bigIntToString(balances.lpVaultAmount),
+    treasury_wsol_amount: bigIntToString(balances.treasuryWsolAmount),
+    treasury_usdc_amount: bigIntToString(balances.treasuryUsdcAmount),
+    last_trade_ts: Number(state.lastTradeTs || 0n) || null,
   });
-  // optional: allow global streams
-  socket.on("joinGlobalPrices", () => socket.join("global:prices"));
-  socket.on("joinGlobalEvents", () => socket.join("global:events"));
-});
 
-server.listen(WS_PORT, () => {
-  console.log(`Indexer socket server on :${WS_PORT}`);
-});
-
-const candleEmitThrottle = new Map(); // mint -> lastEmitMs
-
-function emitCandleThrottled(mint, candle) {
-  const nowMs = Date.now();
-  const last = candleEmitThrottle.get(mint) || 0;
-  if (nowMs - last < 1000) return; // max 1/sec per mint
-  candleEmitThrottle.set(mint, nowMs);
-
-  io.to(`mint:${mint}:candles:1m`).emit("candle", { tf: "1m", ...candle });
-}
-
-const TICK_FLUSH_MS = Number(process.env.TICK_FLUSH_MS || 250);
-
-// latest tick per mint (overwritten frequently)
-const pendingTicks = new Map(); // mint -> tick
-
-function queueTick(mint, tick) {
-  if (!mint) return;
-  pendingTicks.set(mint, tick);
-}
-
-setInterval(() => {
-  if (pendingTicks.size === 0) return;
-
-  // flush each mint once per interval
-  for (const [mint, tick] of pendingTicks.entries()) {
-    io.to(`mint:${mint}:ticks`).emit("tick", tick);
+  if (io && stats) {
+    io.to(`mint:${mint}`).emit("stats", stats);
+    io.to(`mint:${mint}:stats`).emit("stats", stats);
   }
-  pendingTicks.clear();
-}, TICK_FLUSH_MS);
 
-console.log(`Tick batching enabled: flush every ${TICK_FLUSH_MS}ms`);
-// --------------------
-// SOL price poller (Dexscreener)
-// --------------------
-const SOL_PAIR =
-  process.env.DEX_SOL_PAIR ||
-  "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2";
+  return { state, balances, stats, pdas };
+}
 
-const DEX_URL = `https://api.dexscreener.com/latest/dex/pairs/solana/${SOL_PAIR}`;
+async function fetchParsedTransactionWithRetry(sig) {
+  for (let i = 0; i < TX_FETCH_RETRIES; i++) {
+    try {
+      const tx = await connection.getParsedTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx) return tx;
+    } catch (e) {
+      if (i === TX_FETCH_RETRIES - 1) throw e;
+    }
+    await sleep(TX_FETCH_DELAY_MS);
+  }
+  return null;
+}
 
-async function pollSolPriceOnce() {
-  const res = await fetch(DEX_URL);
+function tokenBalanceMap(tokenBalances = []) {
+  const map = new Map();
+  for (const b of tokenBalances || []) {
+    const key = `${b.accountIndex}:${b.mint}`;
+    map.set(key, {
+      accountIndex: b.accountIndex,
+      mint: b.mint,
+      owner: b.owner || null,
+      amount: toBigIntMaybe(b.uiTokenAmount?.amount || "0"),
+      decimals: b.uiTokenAmount?.decimals ?? null,
+    });
+  }
+  return map;
+}
+
+function getTokenDeltas(tx) {
+  const pre = tokenBalanceMap(tx?.meta?.preTokenBalances || []);
+  const post = tokenBalanceMap(tx?.meta?.postTokenBalances || []);
+  const keys = new Set([...pre.keys(), ...post.keys()]);
+  const deltas = [];
+
+  for (const key of keys) {
+    const before = pre.get(key);
+    const after = post.get(key);
+    const ref = after || before;
+    const delta = (after?.amount || 0n) - (before?.amount || 0n);
+    if (delta === 0n) continue;
+    deltas.push({
+      accountIndex: ref.accountIndex,
+      mint: ref.mint,
+      owner: ref.owner,
+      delta,
+      before: before?.amount || 0n,
+      after: after?.amount || 0n,
+      decimals: ref.decimals,
+    });
+  }
+
+  return deltas;
+}
+
+function getSigners(tx) {
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  return keys
+    .filter((k) => k.signer)
+    .map((k) => (typeof k.pubkey?.toBase58 === "function" ? k.pubkey.toBase58() : String(k.pubkey)));
+}
+
+function largestDelta(deltas, predicate) {
+  const filtered = deltas.filter(predicate);
+  if (!filtered.length) return null;
+  return filtered.sort((a, b) => {
+    const aa = a.delta < 0n ? -a.delta : a.delta;
+    const bb = b.delta < 0n ? -b.delta : b.delta;
+    return Number(bb - aa);
+  })[0];
+}
+
+function eventMint(event) {
+  return toBase58Maybe(event?.data?.mint);
+}
+
+function eventQuoteAsset(event) {
+  const raw = event?.data?.quote_asset ?? event?.data?.quoteAsset;
+  const u8 = raw === undefined || raw === null ? null : Number(raw.toString ? raw.toString() : raw);
+  return { quoteAssetU8: u8, quoteAsset: QUOTE_BY_U8[u8] || "SOL" };
+}
+
+function classifyEventName(name) {
+  const n = String(name || "");
+  if (n === "BuyEvent" || n === "BuyExecuted") return "BUY";
+  if (n === "SellEvent" || n === "SellExecuted") return "SELL";
+  if (n === "AmmBuyEvent" || n === "AmmBuyExecuted") return "AMM_BUY";
+  if (n === "AmmSellEvent" || n === "AmmSellExecuted") return "AMM_SELL";
+  if (n === "CreatedTxn" || n === "CurveActivated" || n === "DevBuyEvent") return "DEVBUY";
+  return null;
+}
+
+function isLaunchLikeEvent(name) {
+  return [
+    "LaunchEscrowFundedEvent",
+    "LaunchEscrowRefundedEvent",
+    "MigratedEvent",
+    "PoolSwitchStartedEvent",
+    "PoolSwitchCompletedEvent",
+    "CreatedTxn",
+  ].includes(String(name));
+}
+
+function quoteVolumeToSol(quoteAmountBase, quoteAsset) {
+  if (quoteAsset === "USDC") {
+    const solUsd = getPrice("SOL_USD")?.price || null;
+    if (!solUsd) return 0;
+    return quoteBaseToUi(quoteAmountBase, "USDC") / solUsd;
+  }
+  return quoteBaseToUi(quoteAmountBase, "SOL");
+}
+
+function priceFromAmounts({ quoteAmountBase, tokenAmountBase, quoteAsset }) {
+  const tokenUi = baseToUi(tokenAmountBase, TOKEN_DECIMALS);
+  if (!tokenUi) return { priceQuote: null, priceSol: null, priceUsd: null };
+
+  const quoteUi = quoteBaseToUi(quoteAmountBase, quoteAsset);
+  const priceQuote = quoteUi / tokenUi;
+  const solUsd = getPrice("SOL_USD")?.price || null;
+  const priceSol = quoteAsset === "USDC" ? (solUsd ? priceQuote / solUsd : null) : priceQuote;
+  const priceUsd = quoteAsset === "USDC" ? priceQuote : (solUsd && priceSol ? priceSol * solUsd : null);
+  return { priceQuote, priceSol, priceUsd };
+}
+
+async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
+  const name = event.name;
+  const side = classifyEventName(name);
+  if (!side) return null;
+
+  const mint = eventMint(event);
+  if (!mint) return null;
+
+  const refreshed = await refreshMintState(mint, io);
+  const phase = refreshed?.stats?.phase || null;
+  const phaseU8 = refreshed?.stats?.phase_u8 ?? null;
+  const eventQuote = eventQuoteAsset(event);
+  const quoteAsset = eventQuote.quoteAsset || refreshed?.stats?.quote_asset || "SOL";
+  const quoteAssetU8 = eventQuote.quoteAssetU8 ?? refreshed?.stats?.quote_asset_u8 ?? (quoteAsset === "USDC" ? 1 : 0);
+  const quoteMint = quoteMintForAsset(quoteAsset);
+
+  const deltas = getTokenDeltas(tx);
+  const signers = getSigners(tx).filter((x) => x !== PLATFORM_WALLET);
+  const amountFromEvent = toBigIntMaybe(event?.data?.amount ?? event?.data?.devbuy ?? 0n);
+
+  const tokenPositive = largestDelta(deltas, (d) => d.mint === mint && d.delta > 0n);
+  const tokenNegative = largestDelta(deltas, (d) => d.mint === mint && d.delta < 0n);
+  const quotePositive = largestDelta(deltas, (d) => d.mint === quoteMint && d.delta > 0n);
+  const quoteNegative = largestDelta(deltas, (d) => d.mint === quoteMint && d.delta < 0n);
+
+  let user = null;
+  let inputAmount = 0n;
+  let inputMint = null;
+  let outputAmount = 0n;
+  let outputMint = null;
+  let quoteAmount = 0n;
+  let tokenAmount = 0n;
+
+  if (side === "BUY" || side === "AMM_BUY" || side === "DEVBUY") {
+    user = tokenPositive?.owner || quoteNegative?.owner || signers[0] || null;
+    inputMint = quoteMint;
+    outputMint = mint;
+    inputAmount = amountFromEvent || (quoteNegative ? -quoteNegative.delta : 0n);
+    outputAmount = tokenPositive?.delta || 0n;
+    quoteAmount = inputAmount;
+    tokenAmount = outputAmount;
+  }
+
+  if (side === "SELL" || side === "AMM_SELL") {
+    user = tokenNegative?.owner || quotePositive?.owner || signers[0] || null;
+    inputMint = mint;
+    outputMint = quoteMint;
+    inputAmount = amountFromEvent || (tokenNegative ? -tokenNegative.delta : 0n);
+    outputAmount = quotePositive?.delta || 0n;
+    tokenAmount = inputAmount;
+    quoteAmount = outputAmount;
+  }
+
+  let price = priceFromAmounts({ quoteAmountBase: quoteAmount, tokenAmountBase: tokenAmount, quoteAsset });
+
+  if (!price.priceSol && refreshed?.stats?.price_sol) {
+    price = {
+      priceQuote: refreshed.stats.price_quote,
+      priceSol: refreshed.stats.price_sol,
+      priceUsd: refreshed.stats.price_usd,
+    };
+  }
+
+  const createdAt = tx?.blockTime || now();
+  const volumeQuote = quoteBaseToUi(quoteAmount, quoteAsset) || 0;
+  const volumeSol = quoteVolumeToSol(quoteAmount, quoteAsset) || 0;
+  const volumeUsd = price.priceUsd && baseToUi(tokenAmount) ? price.priceUsd * baseToUi(tokenAmount) : 0;
+  const volumeTokens = baseToUi(tokenAmount) || 0;
+
+  const tradeRow = {
+    sig,
+    slot,
+    block_time: tx?.blockTime ?? null,
+    log_index: logIndex,
+    mint,
+    user,
+    side,
+    phase,
+    phase_u8: phaseU8,
+    quote_asset: quoteAsset,
+    quote_asset_u8: quoteAssetU8,
+    input_amount: bigIntToString(inputAmount),
+    input_mint: inputMint,
+    output_amount: bigIntToString(outputAmount),
+    output_mint: outputMint,
+    quote_amount: bigIntToString(quoteAmount),
+    token_amount: bigIntToString(tokenAmount),
+    price_quote: price.priceQuote,
+    price_sol: price.priceSol,
+    price_usd: price.priceUsd,
+    creator_fee: bigIntToString(event?.data?.creator_fee ?? event?.data?.creatorFee),
+    platform_fee: bigIntToString(event?.data?.platform_fee ?? event?.data?.platformFee),
+    lp_fee: bigIntToString(event?.data?.lp_fee ?? event?.data?.lpFee),
+    tokens_sold_total: refreshed?.stats?.tokens_sold || null,
+    sol_collected_total: refreshed?.state?.solCollected ? refreshed.state.solCollected.toString() : null,
+    raw_event_name: name,
+    raw_event_json: stringifySafe(event.data),
+    created_at: createdAt,
+  };
+
+  insertTrade(tradeRow);
+
+  const candle = upsertCandle1m({
+    mint,
+    ts: createdAt,
+    priceSol: price.priceSol,
+    priceUsd: price.priceUsd,
+    volumeQuote,
+    volumeSol,
+    volumeUsd,
+    volumeTokens,
+    side,
+  });
+
+  const stats = refresh24hVolume(mint);
+
+  const payload = {
+    ...tradeRow,
+    priceSol: price.priceSol,
+    priceUsd: price.priceUsd,
+    createdAt,
+  };
+
+  if (io) {
+    io.to("global:trades").emit("trade", payload);
+    io.to(`mint:${mint}`).emit("trade", payload);
+    io.to(`mint:${mint}:trades`).emit("trade", payload);
+
+    if (candle) {
+      io.to(`mint:${mint}`).emit("candle", { interval: "1m", ...candle });
+      io.to(`mint:${mint}:candles:1m`).emit("candle", { interval: "1m", ...candle });
+    }
+
+    if (stats) {
+      io.to(`mint:${mint}`).emit("stats", stats);
+      io.to(`mint:${mint}:stats`).emit("stats", stats);
+    }
+  }
+
+  return payload;
+}
+
+async function handleEvent({ sig, slot, tx, event, logIndex, io }) {
+  const mint = eventMint(event);
+  const user = toBase58Maybe(event?.data?.user ?? event?.data?.creator ?? event?.data?.dev);
+
+  insertEvent({
+    sig,
+    slot,
+    log_index: logIndex,
+    mint,
+    user,
+    event_name: event.name,
+    payload_json: stringifySafe(event.data),
+    created_at: tx?.blockTime || now(),
+  });
+
+  if (mint) {
+    if (event.name === "LaunchEscrowFundedEvent") {
+      const pdas = derivePdas(mint);
+      upsertLaunch(mint, {
+        launch_escrow: pdas.launchEscrow,
+        escrow_sol_vault: pdas.escrowSolVault,
+        creator: toBase58Maybe(event.data.creator),
+      });
+    }
+
+    await refreshMintState(mint, io).catch((e) => {
+      if (!["LaunchEscrowFundedEvent", "LaunchEscrowRefundedEvent"].includes(event.name)) {
+        console.error(`refreshMintState failed for ${mint}:`, e.message);
+      }
+    });
+  }
+
+  const raw = {
+    sig,
+    slot,
+    logIndex,
+    eventName: event.name,
+    mint,
+    user,
+    payload: JSON.parse(stringifySafe(event.data)),
+  };
+
+  if (io) {
+    if (ENABLE_GLOBAL_EVENTS || isLaunchLikeEvent(event.name)) {
+      io.to("global:events").emit("event", raw);
+    }
+    if (mint) {
+      io.to(`mint:${mint}`).emit("event", raw);
+      io.to(`mint:${mint}:events`).emit("event", raw);
+    }
+  }
+
+  const side = classifyEventName(event.name);
+  if (side) {
+    return handleTradeEvent({ sig, slot, tx, event, logIndex, io });
+  }
+
+  return raw;
+}
+
+async function processSignature(sig, slot, io = null, { force = false } = {}) {
+  if (!force && hasSeenTx(sig)) return { skipped: true, sig };
+
+  const tx = await fetchParsedTransactionWithRetry(sig);
+  if (!tx || tx?.meta?.err) return { skipped: true, sig, reason: "missing_or_failed_tx" };
+
+  const logs = tx.meta?.logMessages || [];
+  const events = decodeEventsFromLogs(logs);
+
+  if (!events.length) {
+    if (!force) markTxSeen(sig, slot);
+    return { skipped: true, sig, reason: "no_events" };
+  }
+
+  if (!force) markTxSeen(sig, slot);
+
+  const handled = [];
+  for (let i = 0; i < events.length; i++) {
+    try {
+      const result = await handleEvent({ sig, slot, tx, event: events[i], logIndex: i, io });
+      handled.push(result);
+    } catch (e) {
+      console.error(`event handle failed ${sig} ${events[i]?.name}:`, e);
+    }
+  }
+
+  return { sig, events: handled.length };
+}
+
+async function backfillRecent(io = null) {
+  if (!STARTUP_BACKFILL_SIGNATURES) return;
+
+  console.log(`Backfilling last ${STARTUP_BACKFILL_SIGNATURES} program signatures...`);
+  const sigs = await connection.getSignaturesForAddress(PROGRAM_PK, {
+    limit: Math.min(1000, STARTUP_BACKFILL_SIGNATURES),
+  }, "confirmed");
+
+  for (const row of sigs.reverse()) {
+    try {
+      await processSignature(row.signature, row.slot, io, { force: false });
+    } catch (e) {
+      console.error("backfill signature failed:", row.signature, e.message);
+    }
+  }
+}
+
+async function pollSolPriceOnce(io = null) {
+  const fixed = process.env.SOL_USD_FIXED ? Number(process.env.SOL_USD_FIXED) : null;
+  if (fixed && Number.isFinite(fixed) && fixed > 0) {
+    setPrice("SOL_USD", fixed);
+    if (io) io.to("global:prices").emit("price", { key: "SOL_USD", price: fixed, updated_at: now() });
+    return fixed;
+  }
+
+  const pair = process.env.DEX_SOL_PAIR || "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2";
+  const url = `https://api.dexscreener.com/latest/dex/pairs/solana/${pair}`;
+
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
 
   const json = await res.json();
-  const pair = json?.pairs?.[0];
-  const priceUsd = pair?.priceUsd ? Number(pair.priceUsd) : null;
-
-  if (!priceUsd || !Number.isFinite(priceUsd)) {
-    throw new Error("No priceUsd in Dexscreener response");
-  }
+  const priceUsd = Number(json?.pairs?.[0]?.priceUsd);
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Dexscreener SOL price missing");
 
   setPrice("SOL_USD", priceUsd);
-
   const payload = { key: "SOL_USD", price: priceUsd, updated_at: now() };
-  io.emit("price", payload);
-  io.to("global:prices").emit("price", payload);
+  if (io) {
+    io.emit("price", payload);
+    io.to("global:prices").emit("price", payload);
+  }
+
+  return priceUsd;
 }
 
-function startSolPricePoller() {
-  const intervalMs = Number(process.env.SOL_PRICE_INTERVAL_MS || 15_000);
-
-  const loop = async () => {
+function startSolPricePoller(io = null) {
+  const interval = Number(process.env.SOL_PRICE_INTERVAL_MS || 15000);
+  const run = async () => {
     try {
-      await pollSolPriceOnce();
+      await pollSolPriceOnce(io);
     } catch (e) {
       console.error("SOL price poll error:", e.message);
     }
   };
 
-  loop();
-  setInterval(loop, intervalMs);
-
-  console.log(`SOL price poller started (${intervalMs}ms) pair ${SOL_PAIR}`);
-}
-startSolPricePoller();
-
-// --------------------
-// candle + stats writers
-// --------------------
-function minuteBucket(tsSec) {
-  return Math.floor(tsSec / 60) * 60;
+  run();
+  return setInterval(run, interval);
 }
 
-function toNumStr(v) {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "string") return v;
-  if (typeof v === "number") return String(v);
-  if (typeof v?.toString === "function") return v.toString();
-  return null;
-}
+function startWebsocket(io = null) {
+  let ws = null;
+  let pingTimer = null;
+  let reconnectTimer = null;
+  let stopped = false;
 
-function safeJson(v) {
-  return JSON.stringify(v, (_, val) => {
-    if (val && typeof val === "object") {
-      if (typeof val.toBase58 === "function") return val.toBase58();
-      if (val.constructor && val.constructor.name === "BN") return val.toString();
-    }
-    return val;
-  });
-}
-
-function asStrMaybePk(v) {
-  if (!v) return null;
-  if (typeof v === "string") return v;
-  if (typeof v.toBase58 === "function") return v.toBase58();
-  if (typeof v.toString === "function") return v.toString();
-  return null;
-}
-
-function computeTradePriceSol({ side, solLamportsStr, tokenBaseStr }) {
-  const solLamports = Number(solLamportsStr || 0);
-  const tokenBase = Number(tokenBaseStr || 0);
-  if (!solLamports || !tokenBase) return null;
-
-  const sol = solLamports / SOL_DECIMALS;
-  const tokens = tokenBase / TOKEN_DECIMALS;
-  if (tokens <= 0) return null;
-
-  return sol / tokens; // SOL per 1 token
-}
-
-function emitTick(mint, ts, side, priceSol) {
-  if (!mint || !priceSol) return;
-
-  const solUsd = getPrice("SOL_USD")?.price || null;
-  const priceUsd = solUsd ? priceSol * solUsd : null;
-
-  queueTick(mint, {
-    mint,
-    ts,
-    side,
-    price_sol: priceSol,
-    price_usd: priceUsd,
-  });
-}
-
-function upsertCandle1m(mint, tsSec, priceSol, volSol, volTokens, side) {
-  const bucket = minuteBucket(tsSec);
-  const existing = db
-    .prepare(`SELECT * FROM candles_1m WHERE mint=? AND bucket_ts=?`)
-    .get(mint, bucket);
-
-  if (!existing) {
-    db.prepare(`
-      INSERT INTO candles_1m (
-        mint, bucket_ts,
-        open_sol, high_sol, low_sol, close_sol,
-        volume_sol, volume_tokens,
-        trades_count, buys_count, sells_count,
-        updated_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(
-      mint,
-      bucket,
-      priceSol,
-      priceSol,
-      priceSol,
-      priceSol,
-      volSol || 0,
-      volTokens || 0,
-      1,
-      side === "BUY" || side === "DEVBUY" ? 1 : 0,
-      side === "SELL" ? 1 : 0,
-      now()
-    );
-    return db.prepare(`SELECT * FROM candles_1m WHERE mint=? AND bucket_ts=?`).get(mint, bucket);
+  function cleanup() {
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = null;
   }
 
-  const high = Math.max(existing.high_sol ?? priceSol, priceSol);
-  const low = Math.min(existing.low_sol ?? priceSol, priceSol);
+  function connect() {
+    if (stopped) return;
+    cleanup();
 
-  db.prepare(`
-    UPDATE candles_1m
-    SET
-      high_sol = ?,
-      low_sol = ?,
-      close_sol = ?,
-      volume_sol = volume_sol + ?,
-      volume_tokens = volume_tokens + ?,
-      trades_count = trades_count + 1,
-      buys_count = buys_count + ?,
-      sells_count = sells_count + ?,
-      updated_at = ?
-    WHERE mint=? AND bucket_ts=?
-  `).run(
-    high,
-    low,
-    priceSol,
-    volSol || 0,
-    volTokens || 0,
-    side === "BUY" || side === "DEVBUY" ? 1 : 0,
-    side === "SELL" ? 1 : 0,
-    now(),
-    mint,
-    bucket
-  );
+    ws = new WebSocket(HELIUS_WSS);
 
-  return db.prepare(`SELECT * FROM candles_1m WHERE mint=? AND bucket_ts=?`).get(mint, bucket);
-}
+    ws.on("open", () => {
+      console.log("Connected to program logs websocket");
 
-// --------------------
-// live aggregated candle emission (derived TFs)
-// --------------------
-const LIVE_TFS = ["5m", "15m", "30m", "1h", "4h", "1d"];
+      pingTimer = setInterval(() => {
+        try { ws.ping(); } catch (_) {}
+      }, 60000);
 
-function getAggCandleForBucket(mint, tf, tsSec) {
-  const step = TF_SECONDS[tf];
-  const tfBucket = Math.floor(tsSec / step) * step;
+      ws.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "logsSubscribe",
+        params: [{ mentions: [PROGRAM_ID] }, { commitment: "confirmed" }],
+      }));
+    });
 
-  const row = db.prepare(`
-    WITH base AS (
-      SELECT
-        bucket_ts,
-        (bucket_ts / ?) * ? AS tf_bucket,
-        open_sol, high_sol, low_sol, close_sol,
-        volume_sol, volume_tokens,
-        trades_count, buys_count, sells_count
-      FROM candles_1m
-      WHERE mint = ?
-        AND bucket_ts >= ?
-        AND bucket_ts <  ?
-    ),
-    ranked AS (
-      SELECT
-        tf_bucket,
-        open_sol,
-        close_sol,
-        high_sol,
-        low_sol,
-        volume_sol,
-        volume_tokens,
-        trades_count, buys_count, sells_count,
-        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts ASC)  AS rn_open,
-        ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts DESC) AS rn_close
-      FROM base
-    )
-    SELECT
-      tf_bucket AS bucket_ts,
-      MAX(CASE WHEN rn_open = 1 THEN open_sol END)  AS open_sol,
-      MAX(high_sol) AS high_sol,
-      MIN(low_sol)  AS low_sol,
-      MAX(CASE WHEN rn_close = 1 THEN close_sol END) AS close_sol,
-      SUM(volume_sol)    AS volume_sol,
-      SUM(volume_tokens) AS volume_tokens,
-      SUM(trades_count)  AS trades_count,
-      SUM(buys_count)    AS buys_count,
-      SUM(sells_count)   AS sells_count
-    FROM ranked
-    WHERE tf_bucket = ?
-    GROUP BY tf_bucket
-  `).get(step, step, mint, tfBucket, tfBucket + step, tfBucket);
+    ws.on("message", async (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString("utf8")); } catch (_) { return; }
 
-  return row || null;
-}
+      if (msg.id === 1 && msg.result) {
+        console.log("logsSubscribe subId:", msg.result);
+        return;
+      }
 
-function emitLiveAggregates(mint, tsSec) {
-  for (const tf of LIVE_TFS) {
-    const step = TF_SECONDS[tf];
-    const tfBucket = Math.floor(tsSec / step) * step;
+      if (msg.method !== "logsNotification") return;
 
-    const key = `${mint}:${tf}`;
-    const prev = lastAggEmit.get(key);
+      const value = msg.params?.result?.value;
+      const slot = msg.params?.result?.context?.slot ?? null;
+      if (!value?.signature || value.err) return;
 
-    // only recompute/emit once per tf-bucket (reduces spam)
-    if (prev === tfBucket) continue;
-    lastAggEmit.set(key, tfBucket);
+      try {
+        await processSignature(value.signature, slot, io);
+      } catch (e) {
+        console.error("processSignature failed:", value.signature, e.message);
+      }
+    });
 
-    const agg = getAggCandleForBucket(mint, tf, tsSec);
-    if (!agg) continue;
-    io.to(`mint:${mint}:candles:${tf}`).emit("candle", { tf, ...agg });
-  }
-}
+    ws.on("close", () => {
+      if (stopped) return;
+      console.log("Program websocket closed. Reconnecting...");
+      cleanup();
+      reconnectTimer = setTimeout(connect, 1500);
+    });
 
-function safeObj(v) {
-  return JSON.parse(JSON.stringify(v, (_, val) => {
-    if (val && typeof val === "object") {
-      if (typeof val.toBase58 === "function") return val.toBase58();
-      if (val.constructor && val.constructor.name === "BN") return val.toString();
-    }
-    return val;
-  }));
-}
-
-function upsertTokenStats(mint, patch) {
-  const existing = db.prepare(`SELECT mint FROM token_stats WHERE mint=?`).get(mint);
-  const fields = Object.keys(patch);
-  if (!fields.length) return;
-
-  if (!existing) {
-    const cols = ["mint", ...fields, "updated_at"];
-    const vals = [mint, ...fields.map((k) => patch[k]), now()];
-    const q = `INSERT INTO token_stats (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`;
-    db.prepare(q).run(...vals);
-  } else {
-    const sets = fields.map((k) => `${k}=?`).join(", ");
-    const vals = [...fields.map((k) => patch[k]), now(), mint];
-    db.prepare(`UPDATE token_stats SET ${sets}, updated_at=? WHERE mint=?`).run(...vals);
+    ws.on("error", (e) => {
+      console.error("Program websocket error:", e.message);
+    });
   }
 
-  return db.prepare(`SELECT * FROM token_stats WHERE mint=?`).get(mint);
-}
-
-// --------------------
-// Helius WS connection (logsSubscribe)
-// --------------------
-const HELIUS_WSS =
-  process.env.HELIUS_WSS ||
-  `wss://devnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY || ""}`;
-
-if (!HELIUS_WSS.startsWith("wss://")) throw new Error("HELIUS_WSS must be a wss:// url");
-
-let ws;
-let pingInterval = null;
-
-function cleanup() {
-  try {
-    if (pingInterval) clearInterval(pingInterval);
-  } catch {}
-  pingInterval = null;
-}
-
-function simulateBuy(mint, solInput) {
-  const stats = db.prepare(`
-    SELECT tokens_sold_total
-    FROM token_stats
-    WHERE mint=?
-  `).get(mint);
-
-  const tokensSold = stats?.tokens_sold_total
-    ? Number(stats.tokens_sold_total) / TOKEN_DECIMALS
-    : 0;
-
-  const virtualSol = V_SOL + tokensSold;
-  const virtualTok = Math.max(1, V_TOK - tokensSold);
-
-  const k = virtualSol * virtualTok;
-
-  const newSol = virtualSol + solInput;
-  const newTok = k / newSol;
-
-  const tokensOut = virtualTok - newTok;
-
-  const priceBefore = virtualSol / virtualTok;
-  const priceAfter = newSol / newTok;
-
-  const solUsd = getPrice("SOL_USD")?.price || null;
-
-  const priceUsd = solUsd ? priceAfter * solUsd : null;
-
-  const marketcapUsd = priceUsd
-    ? priceUsd * TOTAL_SUPPLY_TOKENS
-    : null;
-
-  const marketcapSol = priceAfter * TOTAL_SUPPLY_TOKENS;
+  connect();
 
   return {
-    mint,
-    solInput,
-    tokensOut,
-    priceBefore,
-    priceAfter,
-    priceUsd,
-    marketcapUsd,
-    marketcapSol
+    stop() {
+      stopped = true;
+      cleanup();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { ws?.close(); } catch (_) {}
+    },
   };
 }
 
-function connect() {
-  ws = new WebSocket(HELIUS_WSS);
+async function simulateBuy(mint, quoteInUi) {
+  const token = getToken(mint) || (await refreshMintState(mint).then((r) => r?.stats));
+  if (!token) throw new Error("Token not found");
 
-  ws.on("open", () => {
-    console.log("Connected to Helius WS");
+  const quoteAsset = token.quote_asset || "SOL";
+  const quoteInBase = quoteAsset === "USDC"
+    ? BigInt(Math.floor(Number(quoteInUi) * 1_000_000))
+    : BigInt(Math.floor(Number(quoteInUi) * LAMPORTS_PER_SOL));
 
-    pingInterval = setInterval(() => {
-      try {
-        ws.ping();
-      } catch {}
-    }, 60_000);
+  const fee = quoteInBase * BigInt(TRADE_FEE_BPS) / 10000n;
+  const net = quoteInBase - fee;
 
-    ws.send(JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "logsSubscribe",
-      params: [{ mentions: [PROGRAM_ID] }, { commitment: "confirmed" }],
-    }));
-  });
+  let tokensOut = 0n;
 
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString("utf8")); } catch { return; }
+  if (token.phase === "bonding" || token.phase === "pending_dev_buy") {
+    const tokensRemaining = toBigIntMaybe(token.tokens_remaining, SALE_SUPPLY_BASE);
+    const sold = toBigIntMaybe(token.tokens_sold, 0n);
+    const solCollected = toBigIntMaybe(db.prepare(`SELECT sol_collected FROM launches WHERE mint=?`).get(mint)?.sol_collected, 0n);
+    const x = V_SOL_LAMPORTS + solCollected;
+    const y = V_TOK_BASE + (SALE_SUPPLY_BASE - sold || tokensRemaining);
+    const k = x * y;
+    const newX = x + net;
+    const newY = k / newX;
+    tokensOut = y > newY ? y - newY : 0n;
+    if (tokensOut > tokensRemaining) tokensOut = tokensRemaining;
+  } else {
+    const quoteReserve = quoteAsset === "USDC"
+      ? toBigIntMaybe(token.treasury_usdc_amount, 0n)
+      : toBigIntMaybe(token.treasury_wsol_amount, 0n);
+    const tokenReserve = toBigIntMaybe(token.lp_vault_amount, 0n);
+    const lpFee = fee * 3750n / 10000n;
+    const quoteToPool = net + lpFee;
+    const k = quoteReserve * tokenReserve;
+    const newX = quoteReserve + quoteToPool;
+    const newY = newX > 0n ? k / newX : tokenReserve;
+    tokensOut = tokenReserve > newY ? tokenReserve - newY : 0n;
+  }
 
-    if (msg.id === 1 && msg.result) {
-      console.log("logsSubscribe subId:", msg.result);
-      return;
-    }
+  return {
+    mint,
+    quoteAsset,
+    quoteIn: quoteInUi,
+    fee: quoteBaseToUi(fee, quoteAsset),
+    tokensOut: baseToUi(tokensOut),
+    token,
+  };
+}
 
-    if (msg.method !== "logsNotification") return;
+async function startIndexer({ io = null } = {}) {
+  console.log("Starting Moonz indexer");
+  console.log("Program:", PROGRAM_ID);
+  console.log("RPC:", RPC_URL);
+  console.log("WS:", HELIUS_WSS.replace(/api-key=.*/, "api-key=***"));
+  console.log(`Curve constants: V_SOL=${Number(V_SOL_LAMPORTS) / LAMPORTS_PER_SOL}, V_TOK=${Number(V_TOK_BASE) / TOKEN_SCALE}`);
 
-    const ctxSlot = msg.params?.result?.context?.slot ?? null;
-    const value = msg.params?.result?.value;
-    if (!value) return;
+  const priceTimer = startSolPricePoller(io);
+  await backfillRecent(io);
+  const websocket = startWebsocket(io);
 
-    const sig = value.signature;
-    const logs = value.logs || [];
-    if (!sig) return;
-    if (value.err) return;
+  return {
+    stop() {
+      clearInterval(priceTimer);
+      websocket.stop();
+    },
+  };
+}
 
-    if (hasSeenTx(sig)) return;
-    markTxSeen(sig, ctxSlot);
-
-    for (const line of logs) {
-      const prefix = "Program data: ";
-      if (!line.startsWith(prefix)) continue;
-
-      let buf;
-      try { buf = Buffer.from(line.slice(prefix.length).trim(), "base64"); }
-      catch { continue; }
-
-      let decoded;
-      try { decoded = coder.events.decode(buf); }
-      catch { continue; }
-
-      if (!decoded) continue;
-
-      const eventName = decoded.name;
-      const payload = decoded.data;
-
-      const mint = asStrMaybePk(payload.mint);
-      const user = asStrMaybePk(payload.user);
-
-      // --------------------
-      // launches upserts
-      // --------------------
-      if (eventName === "LaunchInitialized") {
-        upsertLaunch(mint, {
-          launch_state: asStrMaybePk(payload.launch_state),
-          creator: asStrMaybePk(payload.creator),
-          platform: asStrMaybePk(payload.platform),
-          core_authority: asStrMaybePk(payload.core_authority),
-          total_supply: toNumStr(payload.total_supply),
-          sale_supply: toNumStr(payload.sale_supply),
-          lp_supply: toNumStr(payload.lp_supply),
-        });
-      }
-
-      if (eventName === "MetadataInitialized") {
-        upsertLaunch(mint, {
-          name: payload.name ?? null,
-          symbol: payload.symbol ?? null,
-          metadata_uri: payload.uri ?? null,
-        });
-      }
-
-      // --------------------
-      // trades + candles + stats
-      // --------------------
-      const ts = Number(payload.ts ?? now());
-      const solUsd = getPrice("SOL_USD")?.price || null;
-
-      if (eventName === "CurveActivated") {
-        // DEVBUY: use sol_in_gross + tokens_out
-        const solLamports = toNumStr(payload.sol_in_gross);
-        const tokBase = toNumStr(payload.tokens_out);
-        const priceSol = computeTradePriceSol({ side: "DEVBUY", solLamportsStr: solLamports, tokenBaseStr: tokBase });
-
-        insertTrade({
-          sig,
-          slot: ctxSlot,
-          block_time: null,
-          mint,
-          user: asStrMaybePk(payload.dev),
-          side: "DEVBUY",
-          phase_u8: null,
-          sol_in_gross: solLamports,
-          tokens_out: tokBase,
-          ts_i64: toNumStr(payload.ts),
-        });
-
-        if (priceSol) {
-          const volSol = (Number(solLamports) / SOL_DECIMALS);
-          const volTok = (Number(tokBase) / TOKEN_DECIMALS);
-
-          const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "DEVBUY");
-          emitCandleThrottled(mint, candle);
-
-          emitTick(mint, ts, "DEVBUY", priceSol); // ✅ add this
-          emitLiveAggregates(mint, ts);
-        }
-      }
-
-      if (eventName === "BuyExecuted") {
-        const solLamports = toNumStr(payload.sol_in_gross);
-        const tokBase = toNumStr(payload.tokens_out);
-        const priceSol = computeTradePriceSol({ side: "BUY", solLamportsStr: solLamports, tokenBaseStr: tokBase });
-
-        insertTrade({
-          sig,
-          slot: ctxSlot,
-          block_time: null,
-          mint,
-          user,
-          side: "BUY",
-          phase_u8: payload.phase ?? null,
-          sol_in_gross: solLamports,
-          sol_eff_used: toNumStr(payload.sol_eff_used),
-          tokens_out: tokBase,
-          creator_fee: toNumStr(payload.creator_fee),
-          platform_fee: toNumStr(payload.platform_fee),
-          lp_fee: toNumStr(payload.lp_fee),
-          tokens_sold_total: toNumStr(payload.tokens_sold_total),
-          sol_collected_total: toNumStr(payload.sol_collected_total),
-          ts_i64: toNumStr(payload.ts),
-        });
-
-        if (priceSol) {
-          const volSol = (Number(solLamports) / SOL_DECIMALS);
-          const volTok = (Number(tokBase) / TOKEN_DECIMALS);
-
-          const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "BUY");
-
-          const priceUsd = solUsd ? priceSol * solUsd : null;
-          const marketcapUsd = priceUsd ? priceUsd * TOTAL_SUPPLY_TOKENS : null;
-          const marketcapSol = priceSol * TOTAL_SUPPLY_TOKENS;
-
-          // progress uses sale_supply from launches (since migration = sold out)
-          const launch = db.prepare(`SELECT sale_supply FROM launches WHERE mint=?`).get(mint);
-          const saleSupply = launch?.sale_supply ? Number(launch.sale_supply) : null;
-          const soldTotal = payload.tokens_sold_total ? Number(toNumStr(payload.tokens_sold_total)) : null;
-
-          const progress = (saleSupply && soldTotal !== null)
-            ? Math.max(0, Math.min(1, soldTotal / saleSupply))
-            : null;
-
-          const stats = upsertTokenStats(mint, {
-            last_price_sol: priceSol,
-            last_price_usd: priceUsd,
-            marketcap_usd: marketcapUsd,
-            marketcap_sol: marketcapSol,
-            tokens_sold_total: toNumStr(payload.tokens_sold_total),
-            sale_supply: launch?.sale_supply ?? null,
-            progress,
-            last_trade_ts: ts,
-          });
-
-          emitCandleThrottled(mint, candle);
-          emitTick(mint, ts, "BUY", priceSol);
-          emitLiveAggregates(mint, ts);
-          io.to(`mint:${mint}:stats`).emit("stats", stats);
-          io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "BUY", priceSol, ts });
-        }
-      }
-
-      if (eventName === "SellExecuted") {
-        const solLamports = toNumStr(payload.sol_net);
-        const tokBase = toNumStr(payload.tokens_in);
-        const priceSol = computeTradePriceSol({ side: "SELL", solLamportsStr: solLamports, tokenBaseStr: tokBase });
-
-        insertTrade({
-          sig,
-          slot: ctxSlot,
-          block_time: null,
-          mint,
-          user,
-          side: "SELL",
-          phase_u8: payload.phase ?? null,
-          sol_net: solLamports,
-          sol_gross: toNumStr(payload.sol_gross),
-          tokens_in: tokBase,
-          creator_fee: toNumStr(payload.creator_fee),
-          platform_fee: toNumStr(payload.platform_fee),
-          lp_fee: toNumStr(payload.lp_fee),
-          tokens_sold_total: toNumStr(payload.tokens_sold_total),
-          sol_collected_total: toNumStr(payload.sol_collected_total),
-          ts_i64: toNumStr(payload.ts),
-        });
-
-        if (priceSol) {
-          const volSol = (Number(solLamports) / SOL_DECIMALS);
-          const volTok = (Number(tokBase) / TOKEN_DECIMALS);
-
-          const candle = upsertCandle1m(mint, ts, priceSol, volSol, volTok, "SELL");
-
-          const priceUsd = solUsd ? priceSol * solUsd : null;
-          const marketcapUsd = priceUsd ? priceUsd * TOTAL_SUPPLY_TOKENS : null;
-          const marketcapSol = priceSol * TOTAL_SUPPLY_TOKENS;
-
-          const launch = db.prepare(`SELECT sale_supply FROM launches WHERE mint=?`).get(mint);
-          const saleSupply = launch?.sale_supply ? Number(launch.sale_supply) : null;
-          const soldTotal = payload.tokens_sold_total ? Number(toNumStr(payload.tokens_sold_total)) : null;
-
-          const progress = (saleSupply && soldTotal !== null)
-            ? Math.max(0, Math.min(1, soldTotal / saleSupply))
-            : null;
-
-          const stats = upsertTokenStats(mint, {
-            last_price_sol: priceSol,
-            last_price_usd: priceUsd,
-            marketcap_usd: marketcapUsd,
-            marketcap_sol: marketcapSol,
-            tokens_sold_total: toNumStr(payload.tokens_sold_total),
-            sale_supply: launch?.sale_supply ?? null,
-            progress,
-            last_trade_ts: ts,
-          });
-
-          emitCandleThrottled(mint, candle);
-          emitTick(mint, ts, "SELL", priceSol);
-          emitLiveAggregates(mint, ts);
-          io.to(`mint:${mint}:stats`).emit("stats", stats);
-          io.to(`mint:${mint}:trades`).emit("trade", { sig, slot: ctxSlot, mint, user, side: "SELL", priceSol, ts });
-        }
-      }
-
-      const rawEvent = {
-        sig,
-        slot: ctxSlot,
-        eventName,
-        mint,
-        user,
-        payload: safeObj(payload),
-      };
-
-      if (ENABLE_GLOBAL_EVENTS) {
-        io.to("global:events").emit("event", rawEvent);
-      }
-      if (mint) {
-        io.to(`mint:${mint}:events`).emit("event", rawEvent);
-      }
-    } // <-- closes: for (const line of logs)
-  });  // <-- closes: ws.on("message")
-
-  ws.on("close", () => {
-    console.log("Helius WS closed. Reconnecting...");
-    cleanup();
-    setTimeout(connect, 1500);
-  });
-
-  ws.on("error", (e) => {
-    console.error("Helius WS error:", e.message);
+if (require.main === module) {
+  startIndexer().catch((e) => {
+    console.error(e);
+    process.exit(1);
   });
 }
 
-connect();
+module.exports = {
+  startIndexer,
+  processSignature,
+  refreshMintState,
+  simulateBuy,
+  derivePdas,
+  decodeLaunchState,
+};
