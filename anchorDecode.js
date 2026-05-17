@@ -1,18 +1,38 @@
-// anchorDecode.js
 const anchor = require("@coral-xyz/anchor");
 
 function makeEventDecoder(idl) {
   const coder = new anchor.BorshCoder(idl);
 
-  return function decodeEventsFromLogs(logMessages) {
-    const out = [];
+  return function decodeEventsFromLogs(logMessages = []) {
+    const events = [];
+
     for (const line of logMessages || []) {
-      // Anchor events appear as: "Program log: <base64>"
-      // coder.events.decode expects the raw log line
-      const ev = coder.events.decode(line);
-      if (ev) out.push(ev); // { name, data }
+      const candidates = [];
+
+      if (typeof line !== "string") continue;
+
+      if (line.startsWith("Program data: ")) {
+        candidates.push(line.slice("Program data: ".length).trim());
+      }
+
+      if (line.startsWith("Program log: ")) {
+        candidates.push(line.slice("Program log: ".length).trim());
+      }
+
+      candidates.push(line);
+
+      for (const candidate of candidates) {
+        try {
+          const decoded = coder.events.decode(candidate);
+          if (decoded) {
+            events.push(decoded);
+            break;
+          }
+        } catch (_) {}
+      }
     }
-    return out;
+
+    return events;
   };
 }
 
