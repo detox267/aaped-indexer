@@ -469,8 +469,8 @@ function getToken(mint) {
       l.metadata_uri AS launch_metadata_uri,
       l.pinata_cid AS launch_pinata_cid,
 
-      l.launch_ts AS created_at,
-      l.launch_ts AS launch_ts
+      l.launch_ts AS launch_ts,
+      l.launch_ts AS created_at
 
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
@@ -496,8 +496,8 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
         l.metadata_uri AS launch_metadata_uri,
         l.pinata_cid AS launch_pinata_cid,
 
-        l.launch_ts AS created_at,
-        l.launch_ts AS launch_ts
+        l.launch_ts AS launch_ts,
+        l.launch_ts AS created_at
 
       FROM token_stats ts
       LEFT JOIN launches l ON l.mint = ts.mint
@@ -520,8 +520,8 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
       l.metadata_uri AS launch_metadata_uri,
       l.pinata_cid AS launch_pinata_cid,
 
-      l.launch_ts AS created_at,
-      l.launch_ts AS launch_ts
+      l.launch_ts AS launch_ts,
+      l.launch_ts AS created_at
 
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
