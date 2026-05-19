@@ -723,55 +723,204 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
   const side = classifyEventName(name);
   if (!side) return null;
 
+  const data = event?.data || {};
   const mint = eventMint(event);
   if (!mint) return null;
+
+  const isBuy = side === "BUY" || side === "AMM_BUY" || side === "DEVBUY";
+  const isSell = side === "SELL" || side === "AMM_SELL";
 
   const refreshed = await refreshMintState(mint, io);
   const phase = refreshed?.stats?.phase || null;
   const phaseU8 = refreshed?.stats?.phase_u8 ?? null;
+
   const eventQuote = eventQuoteAsset(event);
-  const quoteAsset = eventQuote.quoteAsset || refreshed?.stats?.quote_asset || "SOL";
-  const quoteAssetU8 = eventQuote.quoteAssetU8 ?? refreshed?.stats?.quote_asset_u8 ?? (quoteAsset === "USDC" ? 1 : 0);
+  const quoteAsset =
+    eventQuote.quoteAsset ||
+    refreshed?.stats?.quote_asset ||
+    "SOL";
+
+  const quoteAssetU8 =
+    eventQuote.quoteAssetU8 ??
+    refreshed?.stats?.quote_asset_u8 ??
+    (quoteAsset === "USDC" ? 1 : 0);
+
   const quoteMint = quoteMintForAsset(quoteAsset);
 
   const deltas = getTokenDeltas(tx);
   const signers = getSigners(tx).filter((x) => x !== PLATFORM_WALLET);
-  const amountFromEvent = toBigIntMaybe(event?.data?.amount ?? event?.data?.devbuy ?? 0n);
 
-  const tokenPositive = largestDelta(deltas, (d) => d.mint === mint && d.delta > 0n);
-  const tokenNegative = largestDelta(deltas, (d) => d.mint === mint && d.delta < 0n);
-  const quotePositive = largestDelta(deltas, (d) => d.mint === quoteMint && d.delta > 0n);
-  const quoteNegative = largestDelta(deltas, (d) => d.mint === quoteMint && d.delta < 0n);
+  const tokenPositive = largestDelta(
+    deltas,
+    (d) => d.mint === mint && d.delta > 0n
+  );
 
-  let user = null;
-  let inputAmount = 0n;
-  let inputMint = null;
-  let outputAmount = 0n;
-  let outputMint = null;
-  let quoteAmount = 0n;
-  let tokenAmount = 0n;
+  const tokenNegative = largestDelta(
+    deltas,
+    (d) => d.mint === mint && d.delta < 0n
+  );
 
-  if (side === "BUY" || side === "AMM_BUY" || side === "DEVBUY") {
-    user = tokenPositive?.owner || quoteNegative?.owner || signers[0] || null;
-    inputMint = quoteMint;
-    outputMint = mint;
-    inputAmount = amountFromEvent || (quoteNegative ? -quoteNegative.delta : 0n);
-    outputAmount = tokenPositive?.delta || 0n;
-    quoteAmount = inputAmount;
-    tokenAmount = outputAmount;
+  const quotePositive = largestDelta(
+    deltas,
+    (d) => d.mint === quoteMint && d.delta > 0n
+  );
+
+  const quoteNegative = largestDelta(
+    deltas,
+    (d) => d.mint === quoteMint && d.delta < 0n
+  );
+
+  const eventUser =
+    toBase58Maybe(data.user) ||
+    toBase58Maybe(data.buyer) ||
+    toBase58Maybe(data.seller) ||
+    toBase58Maybe(data.creator) ||
+    toBase58Maybe(data.dev) ||
+    null;
+
+  let user =
+    eventUser ||
+    (isBuy
+      ? tokenPositive?.owner || quoteNegative?.owner
+      : tokenNegative?.owner || quotePositive?.owner) ||
+    signers[0] ||
+    null;
+
+  const eventInputAmount = toBigIntMaybe(
+    data.input_amount ??
+      data.inputAmount ??
+      null,
+    0n
+  );
+
+  const eventOutputAmount = toBigIntMaybe(
+    data.output_amount ??
+      data.outputAmount ??
+      null,
+    0n
+  );
+
+  const eventQuoteAmount = toBigIntMaybe(
+    data.quote_amount ??
+      data.quoteAmount ??
+      null,
+    0n
+  );
+
+  const eventTokenAmount = toBigIntMaybe(
+    data.token_amount ??
+      data.tokenAmount ??
+      null,
+    0n
+  );
+
+  const legacyAmount = toBigIntMaybe(
+    data.amount ??
+      data.devbuy ??
+      0n,
+    0n
+  );
+
+  let inputMint =
+    toBase58Maybe(data.input_mint) ||
+    toBase58Maybe(data.inputMint) ||
+    null;
+
+  let outputMint =
+    toBase58Maybe(data.output_mint) ||
+    toBase58Maybe(data.outputMint) ||
+    null;
+
+  let inputAmount = eventInputAmount;
+  let outputAmount = eventOutputAmount;
+  let quoteAmount = eventQuoteAmount;
+  let tokenAmount = eventTokenAmount;
+
+  // New universal event path.
+  // These fields should come directly from the Rust event and are the source of truth.
+  if (inputAmount > 0n || outputAmount > 0n || quoteAmount > 0n || tokenAmount > 0n) {
+    if (!quoteAmount || quoteAmount <= 0n) {
+      quoteAmount = isBuy ? inputAmount : outputAmount;
+    }
+
+    if (!tokenAmount || tokenAmount <= 0n) {
+      tokenAmount = isBuy ? outputAmount : inputAmount;
+    }
+
+    if (!inputAmount || inputAmount <= 0n) {
+      inputAmount = isBuy ? quoteAmount : tokenAmount;
+    }
+
+    if (!outputAmount || outputAmount <= 0n) {
+      outputAmount = isBuy ? tokenAmount : quoteAmount;
+    }
+
+    if (!inputMint) {
+      inputMint = isBuy ? quoteMint : mint;
+    }
+
+    if (!outputMint) {
+      outputMint = isBuy ? mint : quoteMint;
+    }
+  } else {
+    // Legacy fallback for old events.
+    // Old events only had "amount", so this is less reliable.
+    if (isBuy) {
+      inputMint = quoteMint;
+      outputMint = mint;
+
+      inputAmount = legacyAmount || (quoteNegative ? -quoteNegative.delta : 0n);
+      outputAmount = tokenPositive?.delta || 0n;
+
+      quoteAmount = inputAmount;
+      tokenAmount = outputAmount;
+    }
+
+    if (isSell) {
+      inputMint = mint;
+      outputMint = quoteMint;
+
+      inputAmount = legacyAmount || (tokenNegative ? -tokenNegative.delta : 0n);
+      outputAmount = quotePositive?.delta || 0n;
+
+      tokenAmount = inputAmount;
+      quoteAmount = outputAmount;
+    }
   }
 
-  if (side === "SELL" || side === "AMM_SELL") {
-    user = tokenNegative?.owner || quotePositive?.owner || signers[0] || null;
-    inputMint = mint;
-    outputMint = quoteMint;
-    inputAmount = amountFromEvent || (tokenNegative ? -tokenNegative.delta : 0n);
-    outputAmount = quotePositive?.delta || 0n;
-    tokenAmount = inputAmount;
-    quoteAmount = outputAmount;
+  // Final safety fallback from parsed token balance deltas.
+  if ((!tokenAmount || tokenAmount <= 0n) && isBuy && tokenPositive?.delta) {
+    tokenAmount = tokenPositive.delta;
   }
 
-  let price = priceFromAmounts({ quoteAmountBase: quoteAmount, tokenAmountBase: tokenAmount, quoteAsset });
+  if ((!tokenAmount || tokenAmount <= 0n) && isSell && tokenNegative?.delta) {
+    tokenAmount = -tokenNegative.delta;
+  }
+
+  if ((!quoteAmount || quoteAmount <= 0n) && isBuy && quoteNegative?.delta) {
+    quoteAmount = -quoteNegative.delta;
+  }
+
+  if ((!quoteAmount || quoteAmount <= 0n) && isSell && quotePositive?.delta) {
+    quoteAmount = quotePositive.delta;
+  }
+
+  if ((!inputAmount || inputAmount <= 0n)) {
+    inputAmount = isBuy ? quoteAmount : tokenAmount;
+  }
+
+  if ((!outputAmount || outputAmount <= 0n)) {
+    outputAmount = isBuy ? tokenAmount : quoteAmount;
+  }
+
+  if (!inputMint) inputMint = isBuy ? quoteMint : mint;
+  if (!outputMint) outputMint = isBuy ? mint : quoteMint;
+
+  let price = priceFromAmounts({
+    quoteAmountBase: quoteAmount,
+    tokenAmountBase: tokenAmount,
+    quoteAsset,
+  });
 
   if (!price.priceSol && refreshed?.stats?.price_sol) {
     price = {
@@ -782,9 +931,14 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
   }
 
   const createdAt = tx?.blockTime || now();
+
   const volumeQuote = quoteBaseToUi(quoteAmount, quoteAsset) || 0;
   const volumeSol = quoteVolumeToSol(quoteAmount, quoteAsset) || 0;
-  const volumeUsd = price.priceUsd && baseToUi(tokenAmount) ? price.priceUsd * baseToUi(tokenAmount) : 0;
+  const volumeUsd =
+    price.priceUsd && baseToUi(tokenAmount)
+      ? price.priceUsd * baseToUi(tokenAmount)
+      : 0;
+
   const volumeTokens = baseToUi(tokenAmount) || 0;
 
   const tradeRow = {
@@ -799,22 +953,36 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
     phase_u8: phaseU8,
     quote_asset: quoteAsset,
     quote_asset_u8: quoteAssetU8,
+
     input_amount: bigIntToString(inputAmount),
     input_mint: inputMint,
     output_amount: bigIntToString(outputAmount),
     output_mint: outputMint,
+
     quote_amount: bigIntToString(quoteAmount),
     token_amount: bigIntToString(tokenAmount),
+
     price_quote: price.priceQuote,
     price_sol: price.priceSol,
     price_usd: price.priceUsd,
-    creator_fee: bigIntToString(event?.data?.creator_fee ?? event?.data?.creatorFee),
-    platform_fee: bigIntToString(event?.data?.platform_fee ?? event?.data?.platformFee),
-    lp_fee: bigIntToString(event?.data?.lp_fee ?? event?.data?.lpFee),
-    tokens_sold_total: refreshed?.stats?.tokens_sold || null,
-    sol_collected_total: refreshed?.state?.solCollected ? refreshed.state.solCollected.toString() : null,
+
+    creator_fee: bigIntToString(data.creator_fee ?? data.creatorFee),
+    platform_fee: bigIntToString(data.platform_fee ?? data.platformFee),
+    lp_fee: bigIntToString(data.lp_fee ?? data.lpFee),
+
+    tokens_sold_total:
+      bigIntToString(data.tokens_sold_total ?? data.tokensSoldTotal) ||
+      refreshed?.stats?.tokens_sold ||
+      null,
+
+    sol_collected_total:
+      bigIntToString(data.quote_collected_total ?? data.quoteCollectedTotal) ||
+      (refreshed?.state?.solCollected
+        ? refreshed.state.solCollected.toString()
+        : null),
+
     raw_event_name: name,
-    raw_event_json: stringifySafe(event.data),
+    raw_event_json: stringifySafe(data),
     created_at: createdAt,
   };
 
@@ -848,7 +1016,10 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
 
     if (candle) {
       io.to(`mint:${mint}`).emit("candle", { interval: "1m", ...candle });
-      io.to(`mint:${mint}:candles:1m`).emit("candle", { interval: "1m", ...candle });
+      io.to(`mint:${mint}:candles:1m`).emit("candle", {
+        interval: "1m",
+        ...candle,
+      });
     }
 
     if (stats) {
