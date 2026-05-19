@@ -1,5 +1,8 @@
 require("dotenv").config();
-
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const fetch = globalThis.fetch || require("node-fetch");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -12,6 +15,123 @@ const {
   getPrice,
 } = require("./db");
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
+
+const MEDIA_CACHE_DIR =
+  process.env.MEDIA_CACHE_DIR || "/root/aaped-indexer/media-cache";
+
+const IPFS_GATEWAY =
+  process.env.IPFS_GATEWAY || "https://gateway.pinata.cloud/ipfs";
+
+fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
+
+function ipfsToHttp(uri) {
+  if (!uri) return null;
+
+  const value = String(uri);
+
+  if (value.startsWith("ipfs://")) {
+    const cidPath = value.replace("ipfs://", "").replace(/^\/+/, "");
+    return `${IPFS_GATEWAY.replace(/\/+$/, "")}/${cidPath}`;
+  }
+
+  return value;
+}
+
+function safeImageExt(contentType = "") {
+  if (contentType.includes("png")) return ".png";
+  if (contentType.includes("webp")) return ".webp";
+  if (contentType.includes("gif")) return ".gif";
+  if (contentType.includes("svg")) return ".svg";
+  return ".jpg";
+}
+
+function mediaCacheKey(input) {
+  return crypto.createHash("sha256").update(String(input)).digest("hex");
+}
+
+app.get("/media/token/:mint", async (req, res) => {
+  try {
+    const mint = req.params.mint;
+
+    const row = db.prepare(`
+      SELECT 
+        ts.image AS stats_image,
+        ts.metadata_uri AS stats_metadata_uri,
+        l.image AS launch_image,
+        l.metadata_uri AS launch_metadata_uri
+      FROM token_stats ts
+      LEFT JOIN launches l ON l.mint = ts.mint
+      WHERE ts.mint = ?
+    `).get(mint);
+
+    if (!row) {
+      return res.status(404).json({ error: "Token not found" });
+    }
+
+    let imageUri = row.launch_image || row.stats_image || null;
+
+    // If image missing, try metadata once.
+    if (!imageUri) {
+      const metadataUri = row.launch_metadata_uri || row.stats_metadata_uri || null;
+      const metadataUrl = ipfsToHttp(metadataUri);
+
+      if (metadataUrl) {
+        const metadataRes = await fetch(metadataUrl);
+
+        if (metadataRes.ok) {
+          const metadata = await metadataRes.json().catch(() => null);
+          imageUri = metadata?.image || null;
+        }
+      }
+    }
+
+    if (!imageUri) {
+      return res.status(404).json({ error: "Token image not found" });
+    }
+
+    const imageUrl = ipfsToHttp(imageUri);
+
+    if (!imageUrl) {
+      return res.status(404).json({ error: "Invalid token image" });
+    }
+
+    const key = mediaCacheKey(imageUrl);
+
+    const cachedFile = fs
+      .readdirSync(MEDIA_CACHE_DIR)
+      .find((file) => file.startsWith(`${key}.`));
+
+    if (cachedFile) {
+      const cachedPath = path.join(MEDIA_CACHE_DIR, cachedFile);
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      return res.sendFile(cachedPath);
+    }
+
+    const imageRes = await fetch(imageUrl);
+
+    if (!imageRes.ok) {
+      return res.status(502).json({
+        error: `Image source failed: ${imageRes.status}`,
+      });
+    }
+
+    const contentType = imageRes.headers.get("content-type") || "image/jpeg";
+    const ext = safeImageExt(contentType);
+    const filePath = path.join(MEDIA_CACHE_DIR, `${key}${ext}`);
+
+    const arrayBuffer = await imageRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    fs.writeFileSync(filePath, buffer);
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.send(buffer);
+  } catch (err) {
+    console.error("media token image error:", err);
+    return res.status(500).json({ error: "Failed to load token image" });
+  }
+});
 
 const app = express();
 app.disable("x-powered-by");
