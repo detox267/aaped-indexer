@@ -185,19 +185,38 @@ function derivePdas(mintStr) {
   };
 }
 
-function readPubkey(buf, offset) {
+function hasBytes(buf, offset, len) {
+  return !!buf && Number.isInteger(offset) && offset >= 0 && offset + len <= buf.length;
+}
+
+function readPubkey(buf, offset, fallback = null) {
+  if (!hasBytes(buf, offset, 32)) return fallback;
   return new PublicKey(buf.subarray(offset, offset + 32)).toBase58();
 }
 
-function readU64(buf, offset) {
+function readU8(buf, offset, fallback = 0) {
+  if (!hasBytes(buf, offset, 1)) return fallback;
+  return buf.readUInt8(offset);
+}
+
+function readU16(buf, offset, fallback = 0) {
+  if (!hasBytes(buf, offset, 2)) return fallback;
+  return buf.readUInt16LE(offset);
+}
+
+function readU64(buf, offset, fallback = 0n) {
+  if (!hasBytes(buf, offset, 8)) return fallback;
   return buf.readBigUInt64LE(offset);
 }
 
-function readI64(buf, offset) {
+function readI64(buf, offset, fallback = 0n) {
+  if (!hasBytes(buf, offset, 8)) return fallback;
   return buf.readBigInt64LE(offset);
 }
 
-function readU128(buf, offset) {
+function readU128(buf, offset, fallback = 0n) {
+  if (!hasBytes(buf, offset, 16)) return fallback;
+
   let out = 0n;
   for (let i = 15; i >= 0; i--) {
     out = (out << 8n) + BigInt(buf[offset + i]);
@@ -206,14 +225,15 @@ function readU128(buf, offset) {
 }
 
 function decodeLaunchState(buf) {
-  if (!buf || buf.length < 331) return null;
+  if (!buf || buf.length < 64) return null;
 
   let o = 8;
-  const bump = buf.readUInt8(o); o += 1;
-  const treasuryWsolBump = buf.readUInt8(o); o += 1;
-  const treasuryUsdcBump = buf.readUInt8(o); o += 1;
-  const escrowSolBump = buf.readUInt8(o); o += 1;
-  const stateU8 = buf.readUInt8(o); o += 1;
+
+  const bump = readU8(buf, o); o += 1;
+  const treasuryWsolBump = readU8(buf, o); o += 1;
+  const treasuryUsdcBump = readU8(buf, o); o += 1;
+  const escrowSolBump = readU8(buf, o); o += 1;
+  const stateU8 = readU8(buf, o); o += 1;
 
   const mint = readPubkey(buf, o); o += 32;
   const creator = readPubkey(buf, o); o += 32;
@@ -234,17 +254,17 @@ function decodeLaunchState(buf) {
   const ammInitialTok = readU64(buf, o); o += 8;
   const migratedAt = readI64(buf, o); o += 8;
 
-  const ammType = buf.readUInt8(o); o += 1;
+  const ammType = readU8(buf, o); o += 1;
   const lpShareClaimBase = readU64(buf, o); o += 8;
 
-  const quoteAssetU8 = buf.readUInt8(o); o += 1;
-  const pendingQuoteAssetU8 = buf.readUInt8(o); o += 1;
+  const quoteAssetU8 = readU8(buf, o); o += 1;
+  const pendingQuoteAssetU8 = readU8(buf, o); o += 1;
   const lastPoolSwitchTs = readI64(buf, o); o += 8;
   const switchStartedAt = readI64(buf, o); o += 8;
 
-  const feeTotalBps = buf.readUInt16LE(o); o += 2;
-  const feeCreatorBps = buf.readUInt16LE(o); o += 2;
-  const feePlatformBps = buf.readUInt16LE(o); o += 2;
+  const feeTotalBps = readU16(buf, o); o += 2;
+  const feeCreatorBps = readU16(buf, o); o += 2;
+  const feePlatformBps = readU16(buf, o); o += 2;
 
   const tokensSold = readU64(buf, o); o += 8;
   const solCollected = readU128(buf, o); o += 16;
@@ -252,53 +272,80 @@ function decodeLaunchState(buf) {
   const launchTs = readI64(buf, o); o += 8;
   const lastTradeTs = readI64(buf, o); o += 8;
 
-  const metadata = readPubkey(buf, o); o += 32;
+  let metadata = null;
+  if (hasBytes(buf, o, 32)) {
+    metadata = readPubkey(buf, o);
+    o += 32;
+  }
 
-  const devBuyDone = Boolean(buf.readUInt8(o)); o += 1;
-  const escrowSettled = Boolean(buf.readUInt8(o)); o += 1;
+  let devBuyDone = false;
+  if (hasBytes(buf, o, 1)) {
+    devBuyDone = Boolean(readU8(buf, o));
+    o += 1;
+  }
+
+  let escrowSettled = false;
+  if (hasBytes(buf, o, 1)) {
+    escrowSettled = Boolean(readU8(buf, o));
+    o += 1;
+  }
 
   return {
     bump,
     treasuryWsolBump,
     treasuryUsdcBump,
     escrowSolBump,
+
     stateU8,
     phase: PHASE_BY_U8[stateU8] || "unknown",
+
     mint,
     creator,
     platform,
     coreAuthority,
+
     saleVault,
     lpVault,
     treasuryWsolVault,
     treasuryUsdcVault,
     escrowSolVault,
+
     totalSupply,
     saleSupply,
     lpSupply,
+
     ammInitialSol,
     ammInitialTok,
     migratedAt,
+
     ammType,
     lpShareClaimBase,
+
     quoteAssetU8,
     quoteAsset: QUOTE_BY_U8[quoteAssetU8] || "UNKNOWN",
+
     pendingQuoteAssetU8,
     pendingQuoteAsset: QUOTE_BY_U8[pendingQuoteAssetU8] || "UNKNOWN",
+
     lastPoolSwitchTs,
     switchStartedAt,
+
     feeTotalBps,
     feeCreatorBps,
     feePlatformBps,
+
     tokensSold,
     solCollected,
+
     launchTs,
     lastTradeTs,
+
     metadata,
+
     devBuyDone,
     escrowSettled,
   };
-}
+    }
 
 function decodeTokenAccountAmount(buf) {
   if (!buf || buf.length < 72) return 0n;
