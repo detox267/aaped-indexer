@@ -408,15 +408,30 @@ function calculateStatsFromState(state, balances, solUsd) {
   let priceSol = null;
   let priceUsd = null;
 
-  if (phase === "bonding" || phase === "pending_dev_buy" || phase === "migration_pending") {
-    const quoteReserve = V_SOL_LAMPORTS + (state.solCollected || 0n);
-    const tokenReserve = V_TOK_BASE + tokensRemaining;
+  if (
+  phase === "bonding" ||
+  phase === "pending_dev_buy" ||
+  phase === "migration_pending"
+) {
+  // Bonding curve price must include virtual reserves.
+  //
+  // quote reserve = virtual SOL + real SOL collected
+  // token reserve = virtual token reserve + remaining sale tokens
+  //
+  // price = quoteReserve / tokenReserve
+  const realSolCollected = state.solCollected || 0n;
+  const quoteReserve = V_SOL_LAMPORTS + realSolCollected;
 
-    if (quoteReserve > 0n && tokenReserve > 0n) {
-      priceSol = lamportsToSol(quoteReserve) / baseToUi(tokenReserve);
-      priceQuote = priceSol;
-      priceUsd = solUsd ? priceSol * solUsd : null;
-    }
+  const realTokensRemaining =
+    saleSupply > tokensSold ? saleSupply - tokensSold : 0n;
+
+  const tokenReserve = V_TOK_BASE + realTokensRemaining;
+
+  if (quoteReserve > 0n && tokenReserve > 0n) {
+    priceSol = lamportsToSol(quoteReserve) / baseToUi(tokenReserve);
+    priceQuote = priceSol;
+    priceUsd = solUsd ? priceSol * solUsd : null;
+  }
   } else if (phase === "amm_live" || phase === "switching" || phase === "migrated") {
     const tokenReserve = balances.lpVaultAmount || 0n;
     const quoteReserve = quoteAsset === "USDC" ? (balances.treasuryUsdcAmount || 0n) : (balances.treasuryWsolAmount || 0n);
@@ -428,11 +443,17 @@ function calculateStatsFromState(state, balances, solUsd) {
     }
   }
 
-  const totalSupplyUi = baseToUi(totalSupply);
-  const marketcapQuote = priceQuote == null ? null : priceQuote * totalSupplyUi;
-  const marketcapSol = priceSol == null ? null : priceSol * totalSupplyUi;
-  const marketcapUsd = priceUsd == null ? null : priceUsd * totalSupplyUi;
+  const totalSupplyUi = baseToUi(totalSupply || TOTAL_SUPPLY_BASE);
 
+const marketcapQuote =
+  priceQuote == null ? null : priceQuote * totalSupplyUi;
+
+const marketcapSol =
+  priceSol == null ? null : priceSol * totalSupplyUi;
+
+const marketcapUsd =
+  priceUsd == null ? null : priceUsd * totalSupplyUi;
+  
   const bondingProgress = Number(saleSupply || 0n) > 0
     ? Math.max(0, Math.min(100, (baseToUi(tokensSold) / baseToUi(saleSupply)) * 100))
     : 0;
