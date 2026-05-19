@@ -251,10 +251,75 @@ app.get("/token/:mint", async (req, res) => {
   }
 });
 
+function safeLimit(value, fallback = 50, max = 200) {
+  const n = Number(value || fallback);
+
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+
+  return Math.min(max, Math.floor(n));
+}
+
+function safeOffset(value) {
+  const n = Number(value || 0);
+
+  if (!Number.isFinite(n) || n < 0) return 0;
+
+  return Math.floor(n);
+}
+
+function getTradesWithTokenMeta({ mint = null, limit = 50, offset = 0 } = {}) {
+  const safeMint = mint || null;
+  const safeTradeLimit = safeLimit(limit, 50, 200);
+  const safeTradeOffset = safeOffset(offset);
+
+  if (safeMint) {
+    return db
+      .prepare(`
+        SELECT
+          t.*,
+
+          COALESCE(ts.symbol, l.symbol) AS symbol,
+          COALESCE(ts.name, l.name) AS name,
+          COALESCE(ts.image, l.image) AS image,
+          COALESCE(ts.metadata_uri, l.metadata_uri) AS metadata_uri,
+
+          COALESCE(ts.quote_asset, t.quote_asset, 'SOL') AS quote_asset
+
+        FROM trades t
+        LEFT JOIN token_stats ts ON ts.mint = t.mint
+        LEFT JOIN launches l ON l.mint = t.mint
+        WHERE t.mint = ?
+        ORDER BY t.created_at DESC
+        LIMIT ? OFFSET ?
+      `)
+      .all(safeMint, safeTradeLimit, safeTradeOffset);
+  }
+
+  return db
+    .prepare(`
+      SELECT
+        t.*,
+
+        COALESCE(ts.symbol, l.symbol) AS symbol,
+        COALESCE(ts.name, l.name) AS name,
+        COALESCE(ts.image, l.image) AS image,
+        COALESCE(ts.metadata_uri, l.metadata_uri) AS metadata_uri,
+
+        COALESCE(ts.quote_asset, t.quote_asset, 'SOL') AS quote_asset
+
+      FROM trades t
+      LEFT JOIN token_stats ts ON ts.mint = t.mint
+      LEFT JOIN launches l ON l.mint = t.mint
+      ORDER BY t.created_at DESC
+      LIMIT ? OFFSET ?
+    `)
+    .all(safeTradeLimit, safeTradeOffset);
+}
+
 app.get("/tokens/:mint/trades", (req, res) => {
   try {
     res.json(
-      getTrades({
+      getTradesWithTokenMeta({
         mint: req.params.mint,
         limit: req.query.limit,
         offset: req.query.offset,
@@ -268,7 +333,7 @@ app.get("/tokens/:mint/trades", (req, res) => {
 app.get("/token/:mint/trades", (req, res) => {
   try {
     res.json(
-      getTrades({
+      getTradesWithTokenMeta({
         mint: req.params.mint,
         limit: req.query.limit,
         offset: req.query.offset,
@@ -282,7 +347,7 @@ app.get("/token/:mint/trades", (req, res) => {
 app.get("/trades", (req, res) => {
   try {
     res.json(
-      getTrades({
+      getTradesWithTokenMeta({
         limit: req.query.limit,
         offset: req.query.offset,
       })
@@ -295,7 +360,7 @@ app.get("/trades", (req, res) => {
 app.get("/live-trades", (req, res) => {
   try {
     res.json(
-      getTrades({
+      getTradesWithTokenMeta({
         limit: req.query.limit || 50,
         offset: req.query.offset,
       })
