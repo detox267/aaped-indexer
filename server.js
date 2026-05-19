@@ -1,11 +1,14 @@
 require("dotenv").config();
+
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const fetch = globalThis.fetch || require("node-fetch");
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+
 const {
   db,
   getToken,
@@ -14,6 +17,7 @@ const {
   getCandles,
   getPrice,
 } = require("./db");
+
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
 
 const MEDIA_CACHE_DIR =
@@ -49,20 +53,52 @@ function mediaCacheKey(input) {
   return crypto.createHash("sha256").update(String(input)).digest("hex");
 }
 
+const app = express();
+
+app.disable("x-powered-by");
+app.use(express.json({ limit: "10mb" }));
+
+const allowedOrigins = (
+  process.env.CORS_ORIGINS ||
+  "https://moonz.fun,https://www.moonz.fun,https://moonz-frontend.vercel.app,http://localhost:5173,http://localhost:3000"
+)
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+
+  next();
+});
+
 app.get("/media/token/:mint", async (req, res) => {
   try {
     const mint = req.params.mint;
 
-    const row = db.prepare(`
-      SELECT 
-        ts.image AS stats_image,
-        ts.metadata_uri AS stats_metadata_uri,
-        l.image AS launch_image,
-        l.metadata_uri AS launch_metadata_uri
-      FROM token_stats ts
-      LEFT JOIN launches l ON l.mint = ts.mint
-      WHERE ts.mint = ?
-    `).get(mint);
+    const row = db
+      .prepare(`
+        SELECT 
+          ts.image AS stats_image,
+          ts.metadata_uri AS stats_metadata_uri,
+          l.image AS launch_image,
+          l.metadata_uri AS launch_metadata_uri
+        FROM token_stats ts
+        LEFT JOIN launches l ON l.mint = ts.mint
+        WHERE ts.mint = ?
+      `)
+      .get(mint);
 
     if (!row) {
       return res.status(404).json({ error: "Token not found" });
@@ -70,9 +106,10 @@ app.get("/media/token/:mint", async (req, res) => {
 
     let imageUri = row.launch_image || row.stats_image || null;
 
-    // If image missing, try metadata once.
     if (!imageUri) {
-      const metadataUri = row.launch_metadata_uri || row.stats_metadata_uri || null;
+      const metadataUri =
+        row.launch_metadata_uri || row.stats_metadata_uri || null;
+
       const metadataUrl = ipfsToHttp(metadataUri);
 
       if (metadataUrl) {
@@ -103,7 +140,9 @@ app.get("/media/token/:mint", async (req, res) => {
 
     if (cachedFile) {
       const cachedPath = path.join(MEDIA_CACHE_DIR, cachedFile);
+
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
       return res.sendFile(cachedPath);
     }
 
@@ -126,6 +165,7 @@ app.get("/media/token/:mint", async (req, res) => {
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+
     return res.send(buffer);
   } catch (err) {
     console.error("media token image error:", err);
@@ -133,38 +173,24 @@ app.get("/media/token/:mint", async (req, res) => {
   }
 });
 
-const app = express();
-app.disable("x-powered-by");
-app.use(express.json({ limit: "10mb" }));
-
-const allowedOrigins = (process.env.CORS_ORIGINS || "https://moonz-frontend.vercel.app,https://aaped.fun,https://www.aaped.fun,http://localhost:5173,http://localhost:3000")
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
 app.get("/health", (req, res) => {
   const sol = getPrice("SOL_USD");
-  res.json({ ok: true, service: "moonz-indexer", solPrice: sol?.price || null });
+
+  res.json({
+    ok: true,
+    service: "moonz-indexer",
+    solPrice: sol?.price || null,
+  });
 });
 
 app.get("/prices/sol", (req, res) => {
-  res.json(getPrice("SOL_USD") || { key: "SOL_USD", price: null, updated_at: null });
+  res.json(
+    getPrice("SOL_USD") || {
+      key: "SOL_USD",
+      price: null,
+      updated_at: null,
+    }
+  );
 });
 
 app.get("/tokens", (req, res) => {
@@ -174,6 +200,7 @@ app.get("/tokens", (req, res) => {
       offset: req.query.offset,
       phase: req.query.phase || null,
     });
+
     res.json(rows);
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -185,11 +212,17 @@ app.get("/tokens/:mint", async (req, res) => {
     let token = getToken(req.params.mint);
 
     if (req.query.refresh === "true" || !token) {
-      await refreshMintState(req.params.mint).catch(() => null);
+      await refreshMintState(req.params.mint).catch((err) => {
+        console.error("refreshMintState failed:", err?.message || err);
+      });
+
       token = getToken(req.params.mint);
     }
 
-    if (!token) return res.status(404).json({ error: "Token not found" });
+    if (!token) {
+      return res.status(404).json({ error: "Token not found" });
+    }
+
     res.json(token);
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -201,11 +234,17 @@ app.get("/token/:mint", async (req, res) => {
     let token = getToken(req.params.mint);
 
     if (req.query.refresh === "true" || !token) {
-      await refreshMintState(req.params.mint).catch(() => null);
+      await refreshMintState(req.params.mint).catch((err) => {
+        console.error("refreshMintState failed:", err?.message || err);
+      });
+
       token = getToken(req.params.mint);
     }
 
-    if (!token) return res.status(404).json({ error: "Token not found" });
+    if (!token) {
+      return res.status(404).json({ error: "Token not found" });
+    }
+
     res.json(token);
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -214,7 +253,13 @@ app.get("/token/:mint", async (req, res) => {
 
 app.get("/tokens/:mint/trades", (req, res) => {
   try {
-    res.json(getTrades({ mint: req.params.mint, limit: req.query.limit, offset: req.query.offset }));
+    res.json(
+      getTrades({
+        mint: req.params.mint,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      })
+    );
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
   }
@@ -222,7 +267,13 @@ app.get("/tokens/:mint/trades", (req, res) => {
 
 app.get("/token/:mint/trades", (req, res) => {
   try {
-    res.json(getTrades({ mint: req.params.mint, limit: req.query.limit, offset: req.query.offset }));
+    res.json(
+      getTrades({
+        mint: req.params.mint,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      })
+    );
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
   }
@@ -230,7 +281,12 @@ app.get("/token/:mint/trades", (req, res) => {
 
 app.get("/trades", (req, res) => {
   try {
-    res.json(getTrades({ limit: req.query.limit, offset: req.query.offset }));
+    res.json(
+      getTrades({
+        limit: req.query.limit,
+        offset: req.query.offset,
+      })
+    );
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
   }
@@ -238,7 +294,12 @@ app.get("/trades", (req, res) => {
 
 app.get("/live-trades", (req, res) => {
   try {
-    res.json(getTrades({ limit: req.query.limit || 50, offset: req.query.offset }));
+    res.json(
+      getTrades({
+        limit: req.query.limit || 50,
+        offset: req.query.offset,
+      })
+    );
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
   }
@@ -252,6 +313,7 @@ app.get("/tokens/:mint/candles", (req, res) => {
       limit: req.query.limit || 500,
       since: req.query.since ? Number(req.query.since) : null,
     });
+
     res.json(rows);
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -260,13 +322,17 @@ app.get("/tokens/:mint/candles", (req, res) => {
 
 app.get("/candles", (req, res) => {
   try {
-    if (!req.query.mint) throw new Error("mint required");
+    if (!req.query.mint) {
+      throw new Error("mint required");
+    }
+
     const rows = getCandles({
       mint: req.query.mint,
       interval: String(req.query.interval || "1m"),
       limit: req.query.limit || 500,
       since: req.query.since ? Number(req.query.since) : null,
     });
+
     res.json(rows);
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -275,9 +341,16 @@ app.get("/candles", (req, res) => {
 
 app.get("/simulate-buy", async (req, res) => {
   try {
-    if (!req.query.mint) throw new Error("mint required");
+    if (!req.query.mint) {
+      throw new Error("mint required");
+    }
+
     const amount = Number(req.query.amount || req.query.sol || req.query.usdc || 0);
-    if (!amount || !Number.isFinite(amount) || amount <= 0) throw new Error("amount required");
+
+    if (!amount || !Number.isFinite(amount) || amount <= 0) {
+      throw new Error("amount required");
+    }
+
     res.json(await simulateBuy(req.query.mint, amount));
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -287,7 +360,11 @@ app.get("/simulate-buy", async (req, res) => {
 app.post("/admin/refresh/:mint", async (req, res) => {
   try {
     const result = await refreshMintState(req.params.mint, io);
-    if (!result) return res.status(404).json({ error: "Token state not found" });
+
+    if (!result) {
+      return res.status(404).json({ error: "Token state not found" });
+    }
+
     res.json(result.stats || result);
   } catch (err) {
     res.status(400).json({ error: err.message || String(err) });
@@ -295,15 +372,26 @@ app.post("/admin/refresh/:mint", async (req, res) => {
 });
 
 app.get("/debug/db-counts", (req, res) => {
-  const tables = ["launches", "token_stats", "trades", "events", "candles_1m", "tx_seen"];
+  const tables = [
+    "launches",
+    "token_stats",
+    "trades",
+    "events",
+    "candles_1m",
+    "tx_seen",
+  ];
+
   const out = {};
+
   for (const table of tables) {
     out[table] = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
   }
+
   res.json(out);
 });
 
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins.length ? allowedOrigins : "*",
@@ -322,6 +410,7 @@ io.on("connection", (socket) => {
 
     const mint = typeof msg.mint === "string" ? msg.mint : null;
     const channel = typeof msg.channel === "string" ? msg.channel : null;
+
     if (!mint) return;
 
     if (!channel) {
@@ -331,6 +420,7 @@ io.on("connection", (socket) => {
     }
 
     const room = `mint:${mint}:${channel}`;
+
     socket.join(room);
     socket.emit("joined", { room });
   });
@@ -344,33 +434,42 @@ io.on("connection", (socket) => {
 
     const mint = typeof msg.mint === "string" ? msg.mint : null;
     const channel = typeof msg.channel === "string" ? msg.channel : null;
+
     if (!mint) return;
 
     const room = channel ? `mint:${mint}:${channel}` : `mint:${mint}`;
+
     socket.leave(room);
     socket.emit("left", { room });
   });
 
   socket.on("joinMint", ({ mint } = {}) => {
     if (!mint) return;
+
     socket.join(`mint:${mint}`);
     socket.emit("joined", { room: `mint:${mint}` });
   });
 
   socket.on("leaveMint", ({ mint } = {}) => {
     if (!mint) return;
+
     socket.leave(`mint:${mint}`);
     socket.emit("left", { room: `mint:${mint}` });
   });
 
   socket.on("joinGlobals", () => {
     const rooms = ["global:trades", "global:events", "global:prices"];
-    for (const room of rooms) socket.join(room);
+
+    for (const room of rooms) {
+      socket.join(room);
+    }
+
     socket.emit("joinedGlobals", { rooms });
   });
 
   socket.on("joinRoom", ({ room } = {}) => {
     if (!room) return;
+
     socket.join(room);
     socket.emit("joined", { room });
   });
@@ -385,6 +484,7 @@ app.use((err, req, res, next) => {
   await startIndexer({ io });
 
   const PORT = Number(process.env.PORT || process.env.WS_PORT || 3010);
+
   server.listen(PORT, () => {
     console.log(`Moonz indexer HTTP+Socket server listening on :${PORT}`);
   });
