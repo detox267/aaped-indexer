@@ -454,7 +454,24 @@ function refresh24hVolume(mint) {
 
 function getToken(mint) {
   return db.prepare(`
-    SELECT ts.*, l.creator, l.launch_state, l.launch_escrow, l.metadata, l.description
+    SELECT
+      ts.*,
+
+      l.creator,
+      l.launch_state,
+      l.launch_escrow,
+      l.metadata,
+      l.description,
+
+      l.name AS launch_name,
+      l.symbol AS launch_symbol,
+      l.image AS launch_image,
+      l.metadata_uri AS launch_metadata_uri,
+      l.pinata_cid AS launch_pinata_cid,
+
+      l.launch_ts AS created_at,
+      l.launch_ts AS launch_ts
+
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
     WHERE ts.mint = ?
@@ -467,20 +484,48 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
 
   if (phase) {
     return db.prepare(`
-      SELECT ts.*, l.creator, l.description
+      SELECT
+        ts.*,
+
+        l.creator,
+        l.description,
+
+        l.name AS launch_name,
+        l.symbol AS launch_symbol,
+        l.image AS launch_image,
+        l.metadata_uri AS launch_metadata_uri,
+        l.pinata_cid AS launch_pinata_cid,
+
+        l.launch_ts AS created_at,
+        l.launch_ts AS launch_ts
+
       FROM token_stats ts
       LEFT JOIN launches l ON l.mint = ts.mint
       WHERE ts.phase = ?
-      ORDER BY ts.updated_at DESC
+      ORDER BY COALESCE(l.launch_ts, ts.updated_at) DESC
       LIMIT ? OFFSET ?
     `).all(phase, cappedLimit, safeOffset);
   }
 
   return db.prepare(`
-    SELECT ts.*, l.creator, l.description
+    SELECT
+      ts.*,
+
+      l.creator,
+      l.description,
+
+      l.name AS launch_name,
+      l.symbol AS launch_symbol,
+      l.image AS launch_image,
+      l.metadata_uri AS launch_metadata_uri,
+      l.pinata_cid AS launch_pinata_cid,
+
+      l.launch_ts AS created_at,
+      l.launch_ts AS launch_ts
+
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
-    ORDER BY ts.updated_at DESC
+    ORDER BY COALESCE(l.launch_ts, ts.updated_at) DESC
     LIMIT ? OFFSET ?
   `).all(cappedLimit, safeOffset);
 }
