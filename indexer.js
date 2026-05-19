@@ -45,6 +45,10 @@ const TOKEN_SCALE = 10 ** TOKEN_DECIMALS;
 const SOL_DECIMALS = 9;
 const LAMPORTS_PER_SOL = 1_000_000_000;
 
+const LAUNCH_API_BASE = process.env.LAUNCH_API_BASE || "http://127.0.0.1:3000";
+const PUBLIC_INDEXER_BASE =
+  process.env.PUBLIC_INDEXER_BASE || "https://indexer.moonz.fun";
+
 const TOTAL_SUPPLY_TOKENS = Number(process.env.TOTAL_SUPPLY_TOKENS || 1_000_000_000);
 const SALE_SUPPLY_TOKENS = Number(process.env.SALE_SUPPLY_TOKENS || 650_000_000);
 const LP_SUPPLY_TOKENS = Number(process.env.LP_SUPPLY_TOKENS || 350_000_000);
@@ -94,6 +98,40 @@ function stringifySafe(value) {
     }
     return val;
   });
+}
+
+async function fetchLaunchMetadataFromApi(mint) {
+  if (!mint || !LAUNCH_API_BASE) return null;
+
+  try {
+    const url = `${LAUNCH_API_BASE.replace(/\/+$/, "")}/launch/${encodeURIComponent(mint)}`;
+    const res = await fetch(url);
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const json = await res.json().catch(() => null);
+    if (!json) return null;
+
+    return {
+      name: json.name || null,
+      symbol: json.symbol || null,
+      description: json.description || null,
+      image: json.image || null,
+      metadata_uri: json.metadata_uri || json.metadataUri || null,
+      pinata_cid: json.pinata_cid || json.pinataCid || null,
+      creator: json.creator || json.depositor || null,
+    };
+  } catch (err) {
+    console.warn(`metadata fetch failed for ${mint}:`, err?.message || err);
+    return null;
+  }
+}
+
+function indexerMediaUrl(mint) {
+  if (!mint) return null;
+  return `${PUBLIC_INDEXER_BASE.replace(/\/+$/, "")}/media/token/${encodeURIComponent(mint)}`;
 }
 
 function toBase58Maybe(value) {
@@ -443,9 +481,20 @@ async function refreshMintState(mint, io = null) {
   const solUsd = getPrice("SOL_USD")?.price || null;
   const computed = calculateStatsFromState(state, balances, solUsd);
 
+  // Pull launch metadata from the API DB and copy it into the indexer DB.
+  // This makes the indexer the read source for frontend token pages/cards.
+  const launchMeta = await fetchLaunchMetadataFromApi(mint);
+  const mediaUrl = indexerMediaUrl(mint);
+
   upsertLaunch(mint, {
     launch_state: pdas.launchState,
     launch_escrow: pdas.launchEscrow,
+    name: launchMeta?.name || undefined,
+    symbol: launchMeta?.symbol || undefined,
+    description: launchMeta?.description || undefined,
+    image: launchMeta?.image || undefined,
+    metadata_uri: launchMeta?.metadata_uri || undefined,
+    pinata_cid: launchMeta?.pinata_cid || undefined,
     escrow_sol_vault: state.escrowSolVault || pdas.escrowSolVault,
     sale_vault: state.saleVault || pdas.saleVault,
     lp_vault: state.lpVault || pdas.lpVault,
@@ -483,6 +532,10 @@ async function refreshMintState(mint, io = null) {
   });
 
   const stats = upsertTokenStats(mint, {
+    name: launchMeta?.name || undefined,
+    symbol: launchMeta?.symbol || undefined,
+    image: mediaUrl || undefined,
+    metadata_uri: launchMeta?.metadata_uri || undefined,
     phase: state.phase,
     phase_u8: state.stateU8,
     quote_asset: state.quoteAsset,
