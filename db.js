@@ -184,6 +184,8 @@ CREATE TABLE IF NOT EXISTS token_stats (
   treasury_wsol_amount TEXT,
   treasury_usdc_amount TEXT,
 
+  holders_count INTEGER DEFAULT 0,
+
   volume_24h_quote REAL DEFAULT 0,
   volume_24h_sol REAL DEFAULT 0,
   volume_24h_usd REAL DEFAULT 0,
@@ -195,6 +197,19 @@ CREATE TABLE IF NOT EXISTS token_stats (
 CREATE INDEX IF NOT EXISTS token_stats_marketcap_idx ON token_stats(marketcap_usd);
 CREATE INDEX IF NOT EXISTS token_stats_phase_idx ON token_stats(phase);
 CREATE INDEX IF NOT EXISTS token_stats_updated_idx ON token_stats(updated_at);
+
+CREATE TABLE IF NOT EXISTS token_holders (
+  mint TEXT NOT NULL,
+  owner TEXT NOT NULL,
+  token_account TEXT NOT NULL,
+  amount TEXT NOT NULL DEFAULT '0',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (mint, token_account)
+);
+
+CREATE INDEX IF NOT EXISTS token_holders_mint_owner_idx ON token_holders(mint, owner);
+CREATE INDEX IF NOT EXISTS token_holders_mint_amount_idx ON token_holders(mint, amount);
+CREATE INDEX IF NOT EXISTS token_holders_updated_idx ON token_holders(updated_at);
 
 CREATE TABLE IF NOT EXISTS candles_1m (
   mint TEXT NOT NULL,
@@ -220,6 +235,19 @@ CREATE TABLE IF NOT EXISTS candles_1m (
 
 CREATE INDEX IF NOT EXISTS candles_1m_mint_ts_idx ON candles_1m(mint, bucket_ts);
 `);
+
+function columnExists(table, column) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  return rows.some((r) => r.name === column);
+}
+
+function ensureColumn(table, column, definition) {
+  if (!columnExists(table, column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn("token_stats", "holders_count", "INTEGER DEFAULT 0");
 
 function hasSeenTx(sig) {
   return !!db.prepare(`SELECT sig FROM tx_seen WHERE sig = ?`).get(sig);
@@ -247,19 +275,32 @@ function getPrice(key) {
 
 function upsert(table, keyColumn, keyValue, patch) {
   const fields = Object.keys(patch).filter((k) => patch[k] !== undefined);
-  if (!fields.length) return db.prepare(`SELECT * FROM ${table} WHERE ${keyColumn} = ?`).get(keyValue);
 
-  const existing = db.prepare(`SELECT ${keyColumn} FROM ${table} WHERE ${keyColumn} = ?`).get(keyValue);
+  if (!fields.length) {
+    return db.prepare(`SELECT * FROM ${table} WHERE ${keyColumn} = ?`).get(keyValue);
+  }
+
+  const existing = db
+    .prepare(`SELECT ${keyColumn} FROM ${table} WHERE ${keyColumn} = ?`)
+    .get(keyValue);
 
   if (!existing) {
     const cols = [keyColumn, ...fields, "created_at", "updated_at"];
     const vals = [keyValue, ...fields.map((k) => patch[k]), now(), now()];
-    const q = `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`;
+    const q = `INSERT INTO ${table} (${cols.join(", ")}) VALUES (${cols
+      .map(() => "?")
+      .join(", ")})`;
+
     db.prepare(q).run(...vals);
   } else {
     const sets = fields.map((k) => `${k} = ?`).join(", ");
     const vals = [...fields.map((k) => patch[k]), now(), keyValue];
-    db.prepare(`UPDATE ${table} SET ${sets}, updated_at = ? WHERE ${keyColumn} = ?`).run(...vals);
+
+    db.prepare(`
+      UPDATE ${table}
+      SET ${sets}, updated_at = ?
+      WHERE ${keyColumn} = ?
+    `).run(...vals);
   }
 
   return db.prepare(`SELECT * FROM ${table} WHERE ${keyColumn} = ?`).get(keyValue);
@@ -274,13 +315,23 @@ function upsertTokenStats(mint, patch) {
   if (!fields.length) return getToken(mint);
 
   const existing = db.prepare(`SELECT mint FROM token_stats WHERE mint = ?`).get(mint);
+
   if (!existing) {
     const cols = ["mint", ...fields, "updated_at"];
     const vals = [mint, ...fields.map((k) => patch[k]), now()];
-    db.prepare(`INSERT INTO token_stats (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`).run(...vals);
+
+    db.prepare(`
+      INSERT INTO token_stats (${cols.join(", ")})
+      VALUES (${cols.map(() => "?").join(", ")})
+    `).run(...vals);
   } else {
     const sets = fields.map((k) => `${k} = ?`).join(", ");
-    db.prepare(`UPDATE token_stats SET ${sets}, updated_at = ? WHERE mint = ?`).run(
+
+    db.prepare(`
+      UPDATE token_stats
+      SET ${sets}, updated_at = ?
+      WHERE mint = ?
+    `).run(
       ...fields.map((k) => patch[k]),
       now(),
       mint
@@ -350,15 +401,120 @@ function insertTrade(row) {
   );
 }
 
+function getHolderCount(mint) {
+  const row = db.prepare(`
+    SELECT COUNT(*) AS holders
+    FROM (
+      SELECT owner, SUM(CAST(amount AS INTEGER)) AS total_amount
+      FROM token_holders
+      WHERE mint = ?
+      GROUP BY owner
+      HAVING total_amount > 0
+    )
+  `).get(mint);
+
+  return Number(row?.holders || 0);
+}
+
+function updateTokenHolderCount(mint) {
+  const holders = getHolderCount(mint);
+
+  db.prepare(`
+    UPDATE token_stats
+    SET holders_count = ?, updated_at = ?
+    WHERE mint = ?
+  `).run(holders, now(), mint);
+
+  return holders;
+}
+
+function upsertHolderBalance({ mint, owner, token_account, amount, updated_at }) {
+  if (!mint || !owner) return null;
+
+  const tokenAccount = token_account || owner;
+  const cleanAmount = String(amount ?? "0");
+  const ts = updated_at || now();
+
+  db.prepare(`
+    INSERT INTO token_holders (
+      mint,
+      owner,
+      token_account,
+      amount,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(mint, token_account)
+    DO UPDATE SET
+      owner = excluded.owner,
+      amount = excluded.amount,
+      updated_at = excluded.updated_at
+  `).run(mint, owner, tokenAccount, cleanAmount, ts);
+
+  const holders = updateTokenHolderCount(mint);
+
+  return {
+    mint,
+    owner,
+    token_account: tokenAccount,
+    amount: cleanAmount,
+    holders,
+    updated_at: ts,
+  };
+}
+
+function getHolderSummary(mint) {
+  const token = getToken(mint);
+  const holders = getHolderCount(mint);
+
+  return {
+    mint,
+    holders,
+    holders_count: holders,
+    updated_at: token?.updated_at || now(),
+  };
+}
+
+function getTopHolders({ mint, limit = 50, offset = 0 } = {}) {
+  const cappedLimit = Math.min(200, Math.max(1, Number(limit || 50)));
+  const safeOffset = Math.max(0, Number(offset || 0));
+
+  return db.prepare(`
+    SELECT
+      owner,
+      SUM(CAST(amount AS INTEGER)) AS amount_base,
+      MAX(updated_at) AS updated_at
+    FROM token_holders
+    WHERE mint = ?
+    GROUP BY owner
+    HAVING amount_base > 0
+    ORDER BY amount_base DESC
+    LIMIT ? OFFSET ?
+  `).all(mint, cappedLimit, safeOffset);
+}
+
 function minuteBucket(ts) {
   return Math.floor(Number(ts || now()) / 60) * 60;
 }
 
-function upsertCandle1m({ mint, ts, priceSol, priceUsd, volumeQuote, volumeSol, volumeUsd, volumeTokens, side }) {
+function upsertCandle1m({
+  mint,
+  ts,
+  priceSol,
+  priceUsd,
+  volumeQuote,
+  volumeSol,
+  volumeUsd,
+  volumeTokens,
+  side,
+}) {
   if (!mint || !Number.isFinite(priceSol) || priceSol <= 0) return null;
 
   const bucket = minuteBucket(ts);
-  const existing = db.prepare(`SELECT * FROM candles_1m WHERE mint = ? AND bucket_ts = ?`).get(mint, bucket);
+  const existing = db
+    .prepare(`SELECT * FROM candles_1m WHERE mint = ? AND bucket_ts = ?`)
+    .get(mint, bucket);
+
   const isBuy = side === "BUY" || side === "DEVBUY" || side === "AMM_BUY";
   const isSell = side === "SELL" || side === "AMM_SELL";
 
@@ -394,8 +550,15 @@ function upsertCandle1m({ mint, ts, priceSol, priceUsd, volumeQuote, volumeSol, 
   } else {
     const highSol = Math.max(existing.high_sol ?? priceSol, priceSol);
     const lowSol = Math.min(existing.low_sol ?? priceSol, priceSol);
-    const highUsd = priceUsd == null ? existing.high_usd : Math.max(existing.high_usd ?? priceUsd, priceUsd);
-    const lowUsd = priceUsd == null ? existing.low_usd : Math.min(existing.low_usd ?? priceUsd, priceUsd);
+    const highUsd =
+      priceUsd == null
+        ? existing.high_usd
+        : Math.max(existing.high_usd ?? priceUsd, priceUsd);
+
+    const lowUsd =
+      priceUsd == null
+        ? existing.low_usd
+        : Math.min(existing.low_usd ?? priceUsd, priceUsd);
 
     db.prepare(`
       UPDATE candles_1m
@@ -429,11 +592,14 @@ function upsertCandle1m({ mint, ts, priceSol, priceUsd, volumeQuote, volumeSol, 
     );
   }
 
-  return db.prepare(`SELECT * FROM candles_1m WHERE mint = ? AND bucket_ts = ?`).get(mint, bucket);
+  return db
+    .prepare(`SELECT * FROM candles_1m WHERE mint = ? AND bucket_ts = ?`)
+    .get(mint, bucket);
 }
 
 function refresh24hVolume(mint) {
   const since = now() - 86400;
+
   const row = db.prepare(`
     SELECT
       COALESCE(SUM(volume_quote), 0) AS volume_quote,
@@ -554,7 +720,15 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
   const cappedLimit = Math.min(5000, Math.max(1, Number(limit || 500)));
 
   if (interval !== "1m") {
-    const seconds = { "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400 }[interval];
+    const seconds = {
+      "5m": 300,
+      "15m": 900,
+      "30m": 1800,
+      "1h": 3600,
+      "4h": 14400,
+      "1d": 86400,
+    }[interval];
+
     if (!seconds) throw new Error("Invalid interval");
 
     return db.prepare(`
@@ -613,6 +787,10 @@ module.exports = {
   upsertTokenStats,
   insertEvent,
   insertTrade,
+  upsertHolderBalance,
+  getHolderCount,
+  getHolderSummary,
+  getTopHolders,
   upsertCandle1m,
   refresh24hVolume,
   getToken,
