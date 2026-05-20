@@ -18,6 +18,7 @@ const {
   getPrice,
   getHolderSummary,
   getTopHolders,
+  getCreatorProfile,
 } = require("./db");
 
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
@@ -193,6 +194,28 @@ app.get("/prices/sol", (req, res) => {
       updated_at: null,
     }
   );
+});
+
+app.get("/creator/:address", (req, res) => {
+  try {
+    res.json(getCreatorProfile(req.params.address));
+  } catch (err) {
+    console.error("creator profile error:", err);
+    res.status(400).json({
+      error: err.message || "Failed to load creator profile",
+    });
+  }
+});
+
+app.get("/creators/:address", (req, res) => {
+  try {
+    res.json(getCreatorProfile(req.params.address));
+  } catch (err) {
+    console.error("creator profile error:", err);
+    res.status(400).json({
+      error: err.message || "Failed to load creator profile",
+    });
+  }
 });
 
 app.get("/tokens", (req, res) => {
