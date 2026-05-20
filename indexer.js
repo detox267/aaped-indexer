@@ -833,14 +833,33 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
 
   const deltas = getTokenDeltas(tx);
 
-  const createdAt = tx?.blockTime || now();
+console.log("HOLDER DEBUG", {
+  sig,
+  mint,
+  deltas: deltas.map((d) => ({
+    mint: d.mint,
+    owner: d.owner,
+    tokenAccount: d.tokenAccount,
+    delta: d.delta.toString(),
+    before: d.before.toString(),
+    after: d.after.toString(),
+  })),
+});
 
-  const holdersCount = updateHolderBalancesFromDeltas({
-    mint,
-    deltas,
-    refreshed,
-    createdAt,
-  });
+const createdAt = tx?.blockTime || now();
+
+const holdersCount = updateHolderBalancesFromDeltas({
+  mint,
+  deltas,
+  refreshed,
+  createdAt,
+});
+
+console.log("HOLDERS COUNT AFTER UPDATE", {
+  sig,
+  mint,
+  holdersCount,
+});
 
   const signers = getSigners(tx).filter((x) => x !== PLATFORM_WALLET);
   
