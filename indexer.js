@@ -683,16 +683,6 @@ function getTokenDeltas(tx) {
 function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) {
   if (!mint || !Array.isArray(deltas) || !deltas.length) return undefined;
 
-  const excludedOwners = new Set(
-    [
-      PROGRAM_ID,
-      PLATFORM_WALLET,
-      refreshed?.pdas?.launchState,
-      refreshed?.state?.coreAuthority,
-      refreshed?.state?.platform,
-    ].filter(Boolean)
-  );
-
   const excludedTokenAccounts = new Set(
     [
       refreshed?.state?.saleVault,
@@ -715,17 +705,6 @@ function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) 
 
     const tokenAccount = d.tokenAccount || `${d.accountIndex}:${d.mint}`;
 
-    console.log("HOLDER LOOP CHECK", {
-      tradeMint: mint,
-      deltaMint: d.mint,
-      owner: d.owner,
-      tokenAccount,
-      amountAfter: d.after.toString(),
-      excludedOwner: excludedOwners.has(d.owner),
-      excludedTokenAccount: excludedTokenAccounts.has(tokenAccount),
-    });
-
-    if (excludedOwners.has(d.owner)) continue;
     if (excludedTokenAccounts.has(tokenAccount)) continue;
 
     const result = upsertHolderBalance({
@@ -735,8 +714,6 @@ function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) 
       amount: d.after.toString(),
       updated_at: createdAt || now(),
     });
-
-    console.log("HOLDER UPSERT RESULT", result);
 
     touched = true;
 
@@ -748,7 +725,7 @@ function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) 
   }
 
   return touched ? holders : undefined;
-                }
+}
 
 function getSigners(tx) {
   const keys = tx?.transaction?.message?.accountKeys || [];
