@@ -832,8 +832,18 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
   const quoteMint = quoteMintForAsset(quoteAsset);
 
   const deltas = getTokenDeltas(tx);
-  const signers = getSigners(tx).filter((x) => x !== PLATFORM_WALLET);
 
+  const createdAt = tx?.blockTime || now();
+
+  const holdersCount = updateHolderBalancesFromDeltas({
+    mint,
+    deltas,
+    refreshed,
+    createdAt,
+  });
+
+  const signers = getSigners(tx).filter((x) => x !== PLATFORM_WALLET);
+  
   const tokenPositive = largestDelta(
     deltas,
     (d) => d.mint === mint && d.delta > 0n
@@ -1014,8 +1024,6 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
     };
   }
 
-  const createdAt = tx?.blockTime || now();
-
   const volumeQuote = quoteBaseToUi(quoteAmount, quoteAsset) || 0;
   const volumeSol = quoteVolumeToSol(quoteAmount, quoteAsset) || 0;
   const volumeUsd =
@@ -1109,6 +1117,22 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
     if (stats) {
       io.to(`mint:${mint}`).emit("stats", stats);
       io.to(`mint:${mint}:stats`).emit("stats", stats);
+    }
+
+    if (holdersCount !== undefined) {
+      io.to(`mint:${mint}`).emit("holders", {
+        mint,
+        holders: holdersCount,
+        holders_count: holdersCount,
+        updated_at: createdAt,
+      });
+
+      io.to(`mint:${mint}:holders`).emit("holders", {
+        mint,
+        holders: holdersCount,
+        holders_count: holdersCount,
+        updated_at: createdAt,
+      });
     }
   }
 
