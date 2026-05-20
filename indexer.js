@@ -827,12 +827,6 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
 
   const deltas = getTokenDeltas(tx);
 
-console.log("HOLDERS COUNT AFTER UPDATE", {
-  sig,
-  mint,
-  holdersCount,
-});
-
 const createdAt = tx?.blockTime || now();
 
 const holdersCount = updateHolderBalancesFromDeltas({
