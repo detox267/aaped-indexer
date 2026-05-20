@@ -783,6 +783,191 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
   `).all(mint, since, since, cappedLimit).reverse();
 }
 
+function quoteBaseToUiForAsset(base, quoteAsset) {
+  const n = Number(base || 0);
+
+  if (!Number.isFinite(n)) return 0;
+
+  if (quoteAsset === "USDC") {
+    return n / 1_000_000;
+  }
+
+  return n / 1_000_000_000;
+}
+
+function tradeSolUsd(row) {
+  const priceSol = Number(row.price_sol || 0);
+  const priceUsd = Number(row.price_usd || 0);
+
+  if (priceSol > 0 && priceUsd > 0) {
+    return priceUsd / priceSol;
+  }
+
+  const sol = getPrice("SOL_USD");
+  return Number(sol?.price || 0);
+}
+
+function quoteBaseToUsdForTrade(base, quoteAsset, row) {
+  const amountUi = quoteBaseToUiForAsset(base, quoteAsset);
+
+  if (quoteAsset === "USDC") {
+    return amountUi;
+  }
+
+  const solUsd = tradeSolUsd(row);
+  return solUsd > 0 ? amountUi * solUsd : 0;
+}
+
+function getCreatorTokens(address) {
+  if (!address) return [];
+
+  return db.prepare(`
+    SELECT
+      ts.*,
+
+      l.creator,
+      l.description,
+
+      l.name AS launch_name,
+      l.symbol AS launch_symbol,
+      l.image AS launch_image,
+      l.metadata_uri AS launch_metadata_uri,
+      l.pinata_cid AS launch_pinata_cid,
+
+      l.launch_ts AS launch_ts,
+      l.launch_ts AS created_at
+
+    FROM launches l
+    LEFT JOIN token_stats ts ON ts.mint = l.mint
+    WHERE l.creator = ?
+    ORDER BY COALESCE(ts.last_trade_ts, l.launch_ts, ts.updated_at, l.updated_at) DESC
+  `).all(address);
+}
+
+function getCreatorTrades(address) {
+  if (!address) return [];
+
+  return db.prepare(`
+    SELECT
+      t.*,
+      l.creator
+    FROM trades t
+    INNER JOIN launches l ON l.mint = t.mint
+    WHERE l.creator = ?
+    ORDER BY t.created_at DESC
+  `).all(address);
+}
+
+function getCreatorProfile(address) {
+  const tokensCreated = getCreatorTokens(address);
+  const trades = getCreatorTrades(address);
+
+  const tsNow = now();
+  const todayStart = tsNow - 86400;
+  const weekStart = tsNow - 86400 * 7;
+
+  let totalVolumeUsd = 0;
+  let totalVolume24hUsd = 0;
+
+  let totalCreatorFeesUsd = 0;
+  let creatorFeesTodayUsd = 0;
+  let creatorFeesWeekUsd = 0;
+
+  let totalCreatorFeesSol = 0;
+  let creatorFeesTodaySol = 0;
+  let creatorFeesWeekSol = 0;
+
+  for (const trade of trades) {
+    const quoteAsset = trade.quote_asset || "SOL";
+
+    const volumeUsd =
+      Number(trade.price_usd || 0) > 0 && Number(trade.token_amount || 0) > 0
+        ? quoteBaseToUsdForTrade(trade.quote_amount, quoteAsset, trade)
+        : quoteBaseToUsdForTrade(trade.quote_amount, quoteAsset, trade);
+
+    const creatorFeeUsd = quoteBaseToUsdForTrade(
+      trade.creator_fee,
+      quoteAsset,
+      trade
+    );
+
+    const creatorFeeSol =
+      quoteAsset === "SOL"
+        ? quoteBaseToUiForAsset(trade.creator_fee, "SOL")
+        : 0;
+
+    totalVolumeUsd += volumeUsd;
+    totalCreatorFeesUsd += creatorFeeUsd;
+    totalCreatorFeesSol += creatorFeeSol;
+
+    if (Number(trade.created_at || 0) >= todayStart) {
+      totalVolume24hUsd += volumeUsd;
+      creatorFeesTodayUsd += creatorFeeUsd;
+      creatorFeesTodaySol += creatorFeeSol;
+    }
+
+    if (Number(trade.created_at || 0) >= weekStart) {
+      creatorFeesWeekUsd += creatorFeeUsd;
+      creatorFeesWeekSol += creatorFeeSol;
+    }
+  }
+
+  const activeTokens = tokensCreated.filter((token) => {
+    const phase = String(token.phase || "").toLowerCase();
+
+    return [
+      "bonding",
+      "pending_dev_buy",
+      "migration_pending",
+      "amm_live",
+      "migrated",
+      "switching",
+    ].includes(phase);
+  }).length;
+
+  const liveTokens = tokensCreated.filter((token) => {
+    const phase = String(token.phase || "").toLowerCase();
+
+    return ["amm_live", "migrated", "switching"].includes(phase);
+  }).length;
+
+  const totalMarketCapUsd = tokensCreated.reduce((acc, token) => {
+    return acc + Number(token.marketcap_usd || token.marketCapUsd || 0);
+  }, 0);
+
+  const bestToken =
+    [...tokensCreated].sort((a, b) => {
+      return Number(b.marketcap_usd || 0) - Number(a.marketcap_usd || 0);
+    })[0] || null;
+
+  return {
+    address,
+
+    tokensCreated,
+    tokenCount: tokensCreated.length,
+    activeTokens,
+    liveTokens,
+
+    totalMarketCapUsd,
+    totalVolumeUsd,
+    totalVolume24hUsd,
+
+    totalCreatorFeesUsd,
+    creatorFeesTodayUsd,
+    creatorFeesWeekUsd,
+
+    totalCreatorFeesSol,
+    creatorFeesTodaySol,
+    creatorFeesWeekSol,
+
+    totalFeesEarnedUsd: totalCreatorFeesUsd,
+    totalVolumeUsd,
+
+    bestToken,
+    updated_at: tsNow,
+  };
+}
+
 module.exports = {
   db,
   now,
@@ -804,4 +989,5 @@ module.exports = {
   listTokens,
   getTrades,
   getCandles,
+  getCreatorProfile,
 };
