@@ -16,6 +16,8 @@ const {
   getTrades,
   getCandles,
   getPrice,
+  getHolderSummary,
+  getTopHolders,
 } = require("./db");
 
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
@@ -251,6 +253,60 @@ app.get("/token/:mint", async (req, res) => {
   }
 });
 
+app.get("/tokens/:mint/holders", (req, res) => {
+  try {
+    res.json(getHolderSummary(req.params.mint));
+  } catch (err) {
+    res.status(400).json({
+      error: err.message || "Failed to load holders",
+    });
+  }
+});
+
+app.get("/token/:mint/holders", (req, res) => {
+  try {
+    res.json(getHolderSummary(req.params.mint));
+  } catch (err) {
+    res.status(400).json({
+      error: err.message || "Failed to load holders",
+    });
+  }
+});
+
+app.get("/tokens/:mint/holders/top", (req, res) => {
+  try {
+    res.json({
+      mint: req.params.mint,
+      holders: getTopHolders({
+        mint: req.params.mint,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      }),
+    });
+  } catch (err) {
+    res.status(400).json({
+      error: err.message || "Failed to load top holders",
+    });
+  }
+});
+
+app.get("/token/:mint/holders/top", (req, res) => {
+  try {
+    res.json({
+      mint: req.params.mint,
+      holders: getTopHolders({
+        mint: req.params.mint,
+        limit: req.query.limit,
+        offset: req.query.offset,
+      }),
+    });
+  } catch (err) {
+    res.status(400).json({
+      error: err.message || "Failed to load top holders",
+    });
+  }
+});
+
 function safeLimit(value, fallback = 50, max = 200) {
   const n = Number(value || fallback);
 
@@ -438,12 +494,13 @@ app.post("/admin/refresh/:mint", async (req, res) => {
 
 app.get("/debug/db-counts", (req, res) => {
   const tables = [
-    "launches",
-    "token_stats",
-    "trades",
-    "events",
-    "candles_1m",
-    "tx_seen",
+  "launches",
+  "token_stats",
+  "token_holders",
+  "trades",
+  "events",
+  "candles_1m",
+  "tx_seen",
   ];
 
   const out = {};
