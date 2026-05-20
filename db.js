@@ -451,7 +451,13 @@ function upsertHolderBalance({ mint, owner, token_account, amount, updated_at })
       updated_at = excluded.updated_at
   `).run(mint, owner, tokenAccount, cleanAmount, ts);
 
-  const holders = updateTokenHolderCount(mint);
+  const holders = getHolderCount(mint);
+
+  db.prepare(`
+    UPDATE token_stats
+    SET holders_count = ?, updated_at = ?
+    WHERE mint = ?
+  `).run(holders, ts, mint);
 
   return {
     mint,
@@ -459,6 +465,7 @@ function upsertHolderBalance({ mint, owner, token_account, amount, updated_at })
     token_account: tokenAccount,
     amount: cleanAmount,
     holders,
+    holders_count: holders,
     updated_at: ts,
   };
 }
