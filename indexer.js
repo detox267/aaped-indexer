@@ -827,17 +827,10 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
 
   const deltas = getTokenDeltas(tx);
 
-console.log("HOLDER DEBUG", {
+console.log("HOLDERS COUNT AFTER UPDATE", {
   sig,
   mint,
-  deltas: deltas.map((d) => ({
-    mint: d.mint,
-    owner: d.owner,
-    tokenAccount: d.tokenAccount,
-    delta: d.delta.toString(),
-    before: d.before.toString(),
-    after: d.after.toString(),
-  })),
+  holdersCount,
 });
 
 const createdAt = tx?.blockTime || now();
