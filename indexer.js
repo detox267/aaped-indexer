@@ -707,12 +707,23 @@ function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) 
   );
 
   let holders = undefined;
+  let touched = false;
 
   for (const d of deltas) {
     if (d.mint !== mint) continue;
     if (!d.owner) continue;
 
     const tokenAccount = d.tokenAccount || `${d.accountIndex}:${d.mint}`;
+
+    console.log("HOLDER LOOP CHECK", {
+      tradeMint: mint,
+      deltaMint: d.mint,
+      owner: d.owner,
+      tokenAccount,
+      amountAfter: d.after.toString(),
+      excludedOwner: excludedOwners.has(d.owner),
+      excludedTokenAccount: excludedTokenAccounts.has(tokenAccount),
+    });
 
     if (excludedOwners.has(d.owner)) continue;
     if (excludedTokenAccounts.has(tokenAccount)) continue;
@@ -725,13 +736,19 @@ function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) 
       updated_at: createdAt || now(),
     });
 
+    console.log("HOLDER UPSERT RESULT", result);
+
+    touched = true;
+
     if (result?.holders !== undefined) {
       holders = result.holders;
+    } else if (result?.holders_count !== undefined) {
+      holders = result.holders_count;
     }
   }
 
-  return holders;
-}
+  return touched ? holders : undefined;
+                }
 
 function getSigners(tx) {
   const keys = tx?.transaction?.message?.accountKeys || [];
