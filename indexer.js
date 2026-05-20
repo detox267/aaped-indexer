@@ -19,6 +19,7 @@ const {
   upsertCandle1m,
   refresh24hVolume,
   getToken,
+  upsertHolderBalance,
 } = require("./db");
 
 const fetch = globalThis.fetch || require("node-fetch");
@@ -608,24 +609,50 @@ async function fetchParsedTransactionWithRetry(sig) {
   return null;
 }
 
-function tokenBalanceMap(tokenBalances = []) {
+function accountKeyAtIndex(tx, accountIndex) {
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const key = keys[accountIndex];
+
+  if (!key) return null;
+
+  if (typeof key.pubkey?.toBase58 === "function") {
+    return key.pubkey.toBase58();
+  }
+
+  if (key.pubkey) {
+    return String(key.pubkey);
+  }
+
+  if (typeof key.toBase58 === "function") {
+    return key.toBase58();
+  }
+
+  return String(key);
+}
+
+function tokenBalanceMap(tx, tokenBalances = []) {
   const map = new Map();
+
   for (const b of tokenBalances || []) {
     const key = `${b.accountIndex}:${b.mint}`;
+    const tokenAccount = accountKeyAtIndex(tx, b.accountIndex);
+
     map.set(key, {
       accountIndex: b.accountIndex,
+      tokenAccount,
       mint: b.mint,
       owner: b.owner || null,
       amount: toBigIntMaybe(b.uiTokenAmount?.amount || "0"),
       decimals: b.uiTokenAmount?.decimals ?? null,
     });
   }
+
   return map;
 }
 
 function getTokenDeltas(tx) {
-  const pre = tokenBalanceMap(tx?.meta?.preTokenBalances || []);
-  const post = tokenBalanceMap(tx?.meta?.postTokenBalances || []);
+  const pre = tokenBalanceMap(tx, tx?.meta?.preTokenBalances || []);
+  const post = tokenBalanceMap(tx, tx?.meta?.postTokenBalances || []);
   const keys = new Set([...pre.keys(), ...post.keys()]);
   const deltas = [];
 
@@ -633,10 +660,14 @@ function getTokenDeltas(tx) {
     const before = pre.get(key);
     const after = post.get(key);
     const ref = after || before;
+
     const delta = (after?.amount || 0n) - (before?.amount || 0n);
+
     if (delta === 0n) continue;
+
     deltas.push({
       accountIndex: ref.accountIndex,
+      tokenAccount: ref.tokenAccount,
       mint: ref.mint,
       owner: ref.owner,
       delta,
@@ -647,6 +678,59 @@ function getTokenDeltas(tx) {
   }
 
   return deltas;
+}
+
+function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) {
+  if (!mint || !Array.isArray(deltas) || !deltas.length) return 0;
+
+  const excludedOwners = new Set(
+    [
+      PROGRAM_ID,
+      PLATFORM_WALLET,
+      refreshed?.pdas?.launchState,
+      refreshed?.state?.coreAuthority,
+      refreshed?.state?.platform,
+    ].filter(Boolean)
+  );
+
+  const excludedTokenAccounts = new Set(
+    [
+      refreshed?.state?.saleVault,
+      refreshed?.state?.lpVault,
+      refreshed?.state?.treasuryWsolVault,
+      refreshed?.state?.treasuryUsdcVault,
+      refreshed?.pdas?.saleVault,
+      refreshed?.pdas?.lpVault,
+      refreshed?.pdas?.treasuryWsolVault,
+      refreshed?.pdas?.treasuryUsdcVault,
+    ].filter(Boolean)
+  );
+
+  let holders = 0;
+
+  for (const d of deltas) {
+    if (d.mint !== mint) continue;
+    if (!d.owner) continue;
+
+    const tokenAccount = d.tokenAccount || `${d.accountIndex}:${d.mint}`;
+
+    if (excludedOwners.has(d.owner)) continue;
+    if (excludedTokenAccounts.has(tokenAccount)) continue;
+
+    const result = upsertHolderBalance({
+      mint,
+      owner: d.owner,
+      token_account: tokenAccount,
+      amount: d.after.toString(),
+      updated_at: createdAt || now(),
+    });
+
+    if (result?.holders !== undefined) {
+      holders = result.holders;
+    }
+  }
+
+  return holders;
 }
 
 function getSigners(tx) {
