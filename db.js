@@ -879,11 +879,13 @@ function getCreatorProfile(address) {
 
   for (const trade of trades) {
     const quoteAsset = trade.quote_asset || "SOL";
+    const createdAt = Number(trade.created_at || 0);
 
-    const volumeUsd =
-      Number(trade.price_usd || 0) > 0 && Number(trade.token_amount || 0) > 0
-        ? quoteBaseToUsdForTrade(trade.quote_amount, quoteAsset, trade)
-        : quoteBaseToUsdForTrade(trade.quote_amount, quoteAsset, trade);
+    const volumeUsd = quoteBaseToUsdForTrade(
+      trade.quote_amount,
+      quoteAsset,
+      trade
+    );
 
     const creatorFeeUsd = quoteBaseToUsdForTrade(
       trade.creator_fee,
@@ -900,13 +902,13 @@ function getCreatorProfile(address) {
     totalCreatorFeesUsd += creatorFeeUsd;
     totalCreatorFeesSol += creatorFeeSol;
 
-    if (Number(trade.created_at || 0) >= todayStart) {
+    if (createdAt >= todayStart) {
       totalVolume24hUsd += volumeUsd;
       creatorFeesTodayUsd += creatorFeeUsd;
       creatorFeesTodaySol += creatorFeeSol;
     }
 
-    if (Number(trade.created_at || 0) >= weekStart) {
+    if (createdAt >= weekStart) {
       creatorFeesWeekUsd += creatorFeeUsd;
       creatorFeesWeekSol += creatorFeeSol;
     }
@@ -935,10 +937,23 @@ function getCreatorProfile(address) {
     return acc + Number(token.marketcap_usd || token.marketCapUsd || 0);
   }, 0);
 
-  const bestToken =
+  const bestTokenRow =
     [...tokensCreated].sort((a, b) => {
       return Number(b.marketcap_usd || 0) - Number(a.marketcap_usd || 0);
     })[0] || null;
+
+  const bestToken = bestTokenRow
+    ? {
+        mint: bestTokenRow.mint,
+        name: bestTokenRow.name || bestTokenRow.launch_name || null,
+        symbol: bestTokenRow.symbol || bestTokenRow.launch_symbol || null,
+        image: bestTokenRow.image || bestTokenRow.launch_image || null,
+        phase: bestTokenRow.phase || null,
+        marketcap_usd: Number(bestTokenRow.marketcap_usd || 0),
+        volume_24h_usd: Number(bestTokenRow.volume_24h_usd || 0),
+        holders_count: Number(bestTokenRow.holders_count || 0),
+      }
+    : null;
 
   return {
     address,
@@ -961,7 +976,6 @@ function getCreatorProfile(address) {
     creatorFeesWeekSol,
 
     totalFeesEarnedUsd: totalCreatorFeesUsd,
-    totalVolumeUsd,
 
     bestToken,
     updated_at: tsNow,
