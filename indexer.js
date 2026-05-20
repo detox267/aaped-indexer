@@ -836,12 +836,6 @@ const holdersCount = updateHolderBalancesFromDeltas({
   createdAt,
 });
 
-console.log("HOLDERS COUNT AFTER UPDATE", {
-  sig,
-  mint,
-  holdersCount,
-});
-
   const signers = getSigners(tx).filter((x) => x !== PLATFORM_WALLET);
   
   const tokenPositive = largestDelta(
