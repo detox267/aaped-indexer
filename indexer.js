@@ -681,7 +681,7 @@ function getTokenDeltas(tx) {
 }
 
 function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) {
-  if (!mint || !Array.isArray(deltas) || !deltas.length) return 0;
+  if (!mint || !Array.isArray(deltas) || !deltas.length) return undefined;
 
   const excludedOwners = new Set(
     [
@@ -706,7 +706,7 @@ function updateHolderBalancesFromDeltas({ mint, deltas, refreshed, createdAt }) 
     ].filter(Boolean)
   );
 
-  let holders = 0;
+  let holders = undefined;
 
   for (const d of deltas) {
     if (d.mint !== mint) continue;
