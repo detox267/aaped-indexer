@@ -248,6 +248,10 @@ function ensureColumn(table, column, definition) {
 }
 
 ensureColumn("token_stats", "holders_count", "INTEGER DEFAULT 0");
+ensureColumn("token_stats", "price_change_24h_percent", "REAL DEFAULT 0");
+ensureColumn("token_stats", "price_change_24h_usd", "REAL DEFAULT 0");
+ensureColumn("token_stats", "price_24h_ago_usd", "REAL");
+ensureColumn("token_stats", "price_24h_ago_sol", "REAL");
 
 function hasSeenTx(sig) {
   return !!db.prepare(`SELECT sig FROM tx_seen WHERE sig = ?`).get(sig);
