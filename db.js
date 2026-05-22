@@ -604,6 +604,91 @@ function upsertCandle1m({
     .get(mint, bucket);
 }
 
+function get24hPriceChange(mint) {
+  const since = now() - 86400;
+
+  const token = getToken(mint);
+
+  const latest = db.prepare(`
+    SELECT close_usd, close_sol, bucket_ts
+    FROM candles_1m
+    WHERE mint = ?
+      AND (
+        close_usd IS NOT NULL
+        OR close_sol IS NOT NULL
+      )
+    ORDER BY bucket_ts DESC
+    LIMIT 1
+  `).get(mint);
+
+  const currentUsd =
+    Number(token?.price_usd || 0) > 0
+      ? Number(token.price_usd)
+      : Number(latest?.close_usd || 0);
+
+  const currentSol =
+    Number(token?.price_sol || 0) > 0
+      ? Number(token.price_sol)
+      : Number(latest?.close_sol || 0);
+
+  let old = db.prepare(`
+    SELECT close_usd, close_sol, bucket_ts
+    FROM candles_1m
+    WHERE mint = ?
+      AND bucket_ts <= ?
+      AND (
+        close_usd IS NOT NULL
+        OR close_sol IS NOT NULL
+      )
+    ORDER BY bucket_ts DESC
+    LIMIT 1
+  `).get(mint, since);
+
+  // If token is newer than 24h, compare against the first known candle.
+  if (!old) {
+    old = db.prepare(`
+      SELECT open_usd AS close_usd, open_sol AS close_sol, bucket_ts
+      FROM candles_1m
+      WHERE mint = ?
+        AND bucket_ts >= ?
+        AND (
+          open_usd IS NOT NULL
+          OR open_sol IS NOT NULL
+        )
+      ORDER BY bucket_ts ASC
+      LIMIT 1
+    `).get(mint, since);
+  }
+
+  const oldUsd = Number(old?.close_usd || 0);
+  const oldSol = Number(old?.close_sol || 0);
+
+  const current = currentUsd > 0 ? currentUsd : currentSol;
+  const oldPrice = oldUsd > 0 ? oldUsd : oldSol;
+
+  if (!Number.isFinite(current) || !Number.isFinite(oldPrice) || current <= 0 || oldPrice <= 0) {
+    return {
+      price_change_24h_percent: 0,
+      price_change_24h_usd: 0,
+      price_24h_ago_usd: oldUsd || null,
+      price_24h_ago_sol: oldSol || null,
+    };
+  }
+
+  const change = current - oldPrice;
+  const percent = (change / oldPrice) * 100;
+
+  return {
+    price_change_24h_percent: Number.isFinite(percent) ? percent : 0,
+    price_change_24h_usd:
+      currentUsd > 0 && oldUsd > 0 && Number.isFinite(currentUsd - oldUsd)
+        ? currentUsd - oldUsd
+        : 0,
+    price_24h_ago_usd: oldUsd || null,
+    price_24h_ago_sol: oldSol || null,
+  };
+}
+
 function refresh24hVolume(mint) {
   const since = now() - 86400;
 
@@ -617,11 +702,18 @@ function refresh24hVolume(mint) {
     WHERE mint = ? AND bucket_ts >= ?
   `).get(mint, since);
 
+  const priceChange = get24hPriceChange(mint);
+
   return upsertTokenStats(mint, {
     volume_24h_quote: row.volume_quote || 0,
     volume_24h_sol: row.volume_sol || 0,
     volume_24h_usd: row.volume_usd || 0,
     trades_24h: row.trades_count || 0,
+
+    price_change_24h_percent: priceChange.price_change_24h_percent,
+    price_change_24h_usd: priceChange.price_change_24h_usd,
+    price_24h_ago_usd: priceChange.price_24h_ago_usd,
+    price_24h_ago_sol: priceChange.price_24h_ago_sol,
   });
 }
 
