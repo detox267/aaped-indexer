@@ -796,10 +796,53 @@ function priceFromAmounts({ quoteAmountBase, tokenAmountBase, quoteAsset }) {
   return { priceQuote, priceSol, priceUsd };
 }
 
+const ammTradeSeenBySig = new Map();
+
+function rememberAmmTradeForSig(sig, kind) {
+  if (!sig || !kind) return;
+
+  let set = ammTradeSeenBySig.get(sig);
+
+  if (!set) {
+    set = new Set();
+    ammTradeSeenBySig.set(sig, set);
+  }
+
+  set.add(kind);
+
+  // Prevent unbounded growth in long-running process.
+  if (ammTradeSeenBySig.size > 5000) {
+    const firstKey = ammTradeSeenBySig.keys().next().value;
+    if (firstKey) ammTradeSeenBySig.delete(firstKey);
+  }
+}
+
+function hasAmmTradeForSig(sig, kind) {
+  return !!sig && !!kind && ammTradeSeenBySig.get(sig)?.has(kind);
+}
+
 async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
   const name = event.name;
   const side = classifyEventName(name);
   if (!side) return null;
+
+  // AMM paths currently emit both:
+  // - AmmBuyEvent/AmmSellEvent
+  // - BuyEvent/SellEvent
+  //
+  // For trade indexing, keep the AMM-specific event and ignore the generic
+  // event from the same transaction. Otherwise live trades shows duplicates.
+  if (side === "AMM_BUY") {
+    rememberAmmTradeForSig(sig, "BUY");
+  } else if (side === "AMM_SELL") {
+    rememberAmmTradeForSig(sig, "SELL");
+  } else if (side === "BUY" && hasAmmTradeForSig(sig, "BUY")) {
+    console.log(`Skipping duplicate generic BuyEvent for AMM tx ${sig}`);
+    return null;
+  } else if (side === "SELL" && hasAmmTradeForSig(sig, "SELL")) {
+    console.log(`Skipping duplicate generic SellEvent for AMM tx ${sig}`);
+    return null;
+  }
 
   const data = event?.data || {};
   const mint = eventMint(event);
