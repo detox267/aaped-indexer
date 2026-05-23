@@ -700,18 +700,28 @@ function refresh24hVolume(mint) {
     SELECT
       COALESCE(SUM(volume_quote), 0) AS volume_quote,
       COALESCE(SUM(volume_sol), 0) AS volume_sol,
-      COALESCE(SUM(volume_usd), 0) AS volume_usd,
+      COALESCE(SUM(volume_usd), 0) AS stored_volume_usd,
       COALESCE(SUM(trades_count), 0) AS trades_count
     FROM candles_1m
     WHERE mint = ? AND bucket_ts >= ?
   `).get(mint, since);
 
+  const volumeSol = Number(row.volume_sol || 0);
+  const solUsd = Number(getPrice("SOL_USD")?.price || 0);
+
+  // Recalculate USD volume from live SOL/USD.
+  // Older candle rows may have volume_usd stored with SOL fixed at $100.
+  const liveVolumeUsd =
+    Number.isFinite(volumeSol) && volumeSol > 0 && Number.isFinite(solUsd) && solUsd > 0
+      ? volumeSol * solUsd
+      : Number(row.stored_volume_usd || 0);
+
   const priceChange = get24hPriceChange(mint);
 
   return upsertTokenStats(mint, {
     volume_24h_quote: row.volume_quote || 0,
-    volume_24h_sol: row.volume_sol || 0,
-    volume_24h_usd: row.volume_usd || 0,
+    volume_24h_sol: volumeSol || 0,
+    volume_24h_usd: liveVolumeUsd || 0,
     trades_24h: row.trades_count || 0,
 
     price_change_24h_percent: priceChange.price_change_24h_percent,
