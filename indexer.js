@@ -65,6 +65,11 @@ const TRADE_FEE_BPS = Number(process.env.TRADE_FEE_BPS || 125);
 
 const WSOL_MINT = process.env.WSOL_MINT || "So11111111111111111111111111111111111111112";
 const USDC_MINT = process.env.USDC_MINT || "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || "";
+const JUPITER_PRICE_API =
+  process.env.JUPITER_PRICE_API || "https://api.jup.ag/price/v3";
+const PRICE_REFRESH_MS = Number(process.env.PRICE_REFRESH_MS || 10000);
 const PLATFORM_WALLET = process.env.PLATFORM_WALLET || "ELZ5aiHLxnaTmbazgbmoSCVS6SyvJ7DbXTDxq682PuKt";
 
 const ENABLE_GLOBAL_EVENTS = process.env.ENABLE_GLOBAL_EVENTS === "true";
@@ -396,76 +401,122 @@ function quoteMintForAsset(quoteAsset) {
 }
 
 function calculateStatsFromState(state, balances, solUsd) {
-  const phase = state.phase;
-  const quoteAsset = state.quoteAsset;
-
   const totalSupply = state.totalSupply || TOTAL_SUPPLY_BASE;
   const saleSupply = state.saleSupply || SALE_SUPPLY_BASE;
-  const lpSupply = state.lpSupply || LP_SUPPLY_BASE;
-  const tokensSold = state.tokensSold || 0n;
-  const tokensRemaining = saleSupply > tokensSold ? saleSupply - tokensSold : 0n;
+  const lpSupply = state.lpSupply || (TOTAL_SUPPLY_BASE - SALE_SUPPLY_BASE);
 
-  let priceQuote = null;
-  let priceSol = null;
-  let priceUsd = null;
+  const quoteAsset = state.quoteAsset || "SOL";
+  const phase = state.phase || "unknown";
+  const stateU8 = Number(state.stateU8 ?? state.state ?? 0);
 
-  if (
-  phase === "bonding" ||
-  phase === "pending_dev_buy" ||
-  phase === "migration_pending"
-) {
-  // Bonding curve price must include virtual reserves.
-  //
-  // quote reserve = virtual SOL + real SOL collected
-  // token reserve = virtual token reserve + remaining sale tokens
-  //
-  // price = quoteReserve / tokenReserve
-  const realSolCollected = state.solCollected || 0n;
-  const quoteReserve = V_SOL_LAMPORTS + realSolCollected;
-
-  const realTokensRemaining =
-    saleSupply > tokensSold ? saleSupply - tokensSold : 0n;
-
-  const tokenReserve = V_TOK_BASE + realTokensRemaining;
-
-  if (quoteReserve > 0n && tokenReserve > 0n) {
-    priceSol = lamportsToSol(quoteReserve) / baseToUi(tokenReserve);
-    priceQuote = priceSol;
-    priceUsd = solUsd ? priceSol * solUsd : null;
-  }
-  } else if (phase === "amm_live" || phase === "switching" || phase === "migrated") {
-    const tokenReserve = balances.lpVaultAmount || 0n;
-    const quoteReserve = quoteAsset === "USDC" ? (balances.treasuryUsdcAmount || 0n) : (balances.treasuryWsolAmount || 0n);
-
-    if (quoteReserve > 0n && tokenReserve > 0n) {
-      priceQuote = quoteBaseToUi(quoteReserve, quoteAsset) / baseToUi(tokenReserve);
-      priceSol = quoteAsset === "USDC" && solUsd ? priceQuote / solUsd : priceQuote;
-      priceUsd = quoteAsset === "USDC" ? priceQuote : solUsd ? priceSol * solUsd : null;
-    }
-  }
+  const isAmmLive =
+    phase === "amm_live" ||
+    phase === "amm" ||
+    stateU8 === 3;
 
   const totalSupplyUi = baseToUi(totalSupply || TOTAL_SUPPLY_BASE);
+  const saleSupplyUi = baseToUi(saleSupply || SALE_SUPPLY_BASE);
 
-const marketcapQuote =
-  priceQuote == null ? null : priceQuote * totalSupplyUi;
+  let tokensRemaining = 0n;
+  let tokensSold = 0n;
+  let bondingProgress = 0;
 
-const marketcapSol =
-  priceSol == null ? null : priceSol * totalSupplyUi;
+  let priceQuote = 0;
+  let priceSol = 0;
+  let priceUsd = 0;
 
-const marketcapUsd =
-  priceUsd == null ? null : priceUsd * totalSupplyUi;
-  
-  const bondingProgress = Number(saleSupply || 0n) > 0
-    ? Math.max(0, Math.min(100, (baseToUi(tokensSold) / baseToUi(saleSupply)) * 100))
-    : 0;
+  if (isAmmLive) {
+    tokensRemaining = 0n;
+    tokensSold = saleSupply;
+
+    const tokenReserveBase = balances.lpVaultAmount || 0n;
+    const quoteReserveBase =
+      quoteAsset === "USDC"
+        ? balances.treasuryUsdcAmount || 0n
+        : balances.treasuryWsolAmount || 0n;
+
+    const tokenReserveUi = baseToUi(tokenReserveBase, TOKEN_DECIMALS);
+    const quoteReserveUi =
+      quoteAsset === "USDC"
+        ? baseToUi(quoteReserveBase, 6)
+        : lamportsToSol(quoteReserveBase);
+
+    priceQuote =
+      tokenReserveUi > 0 && quoteReserveUi > 0
+        ? quoteReserveUi / tokenReserveUi
+        : 0;
+
+    priceSol =
+      quoteAsset === "USDC"
+        ? solUsd > 0
+          ? priceQuote / solUsd
+          : 0
+        : priceQuote;
+
+    priceUsd =
+      quoteAsset === "USDC"
+        ? priceQuote
+        : priceSol * Number(solUsd || 0);
+
+    bondingProgress = 100;
+  } else {
+    // Bonding curve state must be derived from the actual sale vault.
+    // state.tokensSold can become stale/wrong after account layout changes.
+    const rawRemaining = balances.saleVaultAmount ?? saleSupply;
+
+    if (rawRemaining <= 0n) {
+      tokensRemaining = 0n;
+    } else if (rawRemaining > saleSupply) {
+      tokensRemaining = saleSupply;
+    } else {
+      tokensRemaining = rawRemaining;
+    }
+
+    tokensSold = saleSupply > tokensRemaining ? saleSupply - tokensRemaining : 0n;
+
+    const tokensSoldUi = baseToUi(tokensSold, TOKEN_DECIMALS);
+
+    bondingProgress =
+      saleSupplyUi > 0
+        ? Math.max(0, Math.min(100, (tokensSoldUi / saleSupplyUi) * 100))
+        : 0;
+
+    const tokenReserveBase = V_TOK_BASE + tokensRemaining;
+
+    const tokenReserveUi = baseToUi(tokenReserveBase, TOKEN_DECIMALS);
+
+    const quoteReserveUi =
+      quoteAsset === "USDC"
+        ? (lamportsToSol(V_SOL_LAMPORTS) * Number(solUsd || 0)) +
+          baseToUi(balances.treasuryUsdcAmount || 0n, 6)
+        : lamportsToSol(V_SOL_LAMPORTS) +
+          lamportsToSol(balances.treasuryWsolAmount || 0n);
+
+    priceQuote =
+      tokenReserveUi > 0 && quoteReserveUi > 0
+        ? quoteReserveUi / tokenReserveUi
+        : 0;
+
+    priceSol =
+      quoteAsset === "USDC"
+        ? solUsd > 0
+          ? priceQuote / solUsd
+          : 0
+        : priceQuote;
+
+    priceUsd =
+      quoteAsset === "USDC"
+        ? priceQuote
+        : priceSol * Number(solUsd || 0);
+  }
 
   return {
     priceQuote,
     priceSol,
     priceUsd,
-    marketcapQuote,
-    marketcapSol,
-    marketcapUsd,
+    marketcapQuote: priceQuote * totalSupplyUi,
+    marketcapSol: priceSol * totalSupplyUi,
+    marketcapUsd: priceUsd * totalSupplyUi,
     totalSupply,
     saleSupply,
     lpSupply,
@@ -778,8 +829,9 @@ function isLaunchLikeEvent(name) {
 function quoteVolumeToSol(quoteAmountBase, quoteAsset) {
   if (quoteAsset === "USDC") {
     const solUsd = getPrice("SOL_USD")?.price || null;
+    const usdcUsd = getPrice("USDC_USD")?.price || 1;
     if (!solUsd) return 0;
-    return quoteBaseToUi(quoteAmountBase, "USDC") / solUsd;
+    return (quoteBaseToUi(quoteAmountBase, "USDC") * usdcUsd) / solUsd;
   }
   return quoteBaseToUi(quoteAmountBase, "SOL");
 }
@@ -792,7 +844,8 @@ function priceFromAmounts({ quoteAmountBase, tokenAmountBase, quoteAsset }) {
   const priceQuote = quoteUi / tokenUi;
   const solUsd = getPrice("SOL_USD")?.price || null;
   const priceSol = quoteAsset === "USDC" ? (solUsd ? priceQuote / solUsd : null) : priceQuote;
-  const priceUsd = quoteAsset === "USDC" ? priceQuote : (solUsd && priceSol ? priceSol * solUsd : null);
+  const usdcUsd = getPrice("USDC_USD")?.price || 1;
+  const priceUsd = quoteAsset === "USDC" ? priceQuote * usdcUsd : (solUsd && priceSol ? priceSol * solUsd : null);
   return { priceQuote, priceSol, priceUsd };
 }
 
@@ -1282,32 +1335,95 @@ async function backfillRecent(io = null) {
   }
 }
 
+
+async function fetchJupiterQuotePrices() {
+  const ids = `${WSOL_MINT},${USDC_MINT}`;
+  const url = `${JUPITER_PRICE_API}?ids=${encodeURIComponent(ids)}`;
+
+  const headers = {};
+
+  if (JUPITER_API_KEY) {
+    headers["x-api-key"] = JUPITER_API_KEY;
+  }
+
+  const res = await fetch(url, { headers });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Jupiter price failed ${res.status}: ${text.slice(0, 160)}`);
+  }
+
+  const data = await res.json();
+
+  const solUsd = Number(
+    data?.[WSOL_MINT]?.usdPrice ??
+      data?.[WSOL_MINT]?.price ??
+      data?.[WSOL_MINT]?.priceUsd
+  );
+
+  const usdcUsd = Number(
+    data?.[USDC_MINT]?.usdPrice ??
+      data?.[USDC_MINT]?.price ??
+      data?.[USDC_MINT]?.priceUsd
+  );
+
+  if (!Number.isFinite(solUsd) || solUsd <= 0) {
+    throw new Error("Jupiter price response missing valid SOL/USD");
+  }
+
+  return {
+    solUsd,
+    usdcUsd: Number.isFinite(usdcUsd) && usdcUsd > 0 ? usdcUsd : 1,
+  };
+}
+
+
 async function pollSolPriceOnce(io = null) {
   const fixed = process.env.SOL_USD_FIXED ? Number(process.env.SOL_USD_FIXED) : null;
-  if (fixed && Number.isFinite(fixed) && fixed > 0) {
+
+  if (Number.isFinite(fixed) && fixed > 0) {
     setPrice("SOL_USD", fixed);
-    if (io) io.to("global:prices").emit("price", { key: "SOL_USD", price: fixed, updated_at: now() });
-    return fixed;
+    setPrice("USDC_USD", 1);
+
+    if (io) {
+      io.to("global:prices").emit("price", {
+        key: "SOL_USD",
+        price: fixed,
+        updated_at: now(),
+      });
+
+      io.to("global:prices").emit("price", {
+        key: "USDC_USD",
+        price: 1,
+        updated_at: now(),
+      });
+    }
+
+    console.log(`[prices] SOL_USD fixed $${fixed} USDC_USD fixed $1`);
+    return { solUsd: fixed, usdcUsd: 1 };
   }
 
-  const pair = process.env.DEX_SOL_PAIR || "58oqchx4ywmvkdwllzzbi4chocc2fqcuwbkwmihlyqo2";
-  const url = `https://api.dexscreener.com/latest/dex/pairs/solana/${pair}`;
+  const { solUsd, usdcUsd } = await fetchJupiterQuotePrices();
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
+  setPrice("SOL_USD", solUsd);
+  setPrice("USDC_USD", usdcUsd);
 
-  const json = await res.json();
-  const priceUsd = Number(json?.pairs?.[0]?.priceUsd);
-  if (!Number.isFinite(priceUsd) || priceUsd <= 0) throw new Error("Dexscreener SOL price missing");
-
-  setPrice("SOL_USD", priceUsd);
-  const payload = { key: "SOL_USD", price: priceUsd, updated_at: now() };
   if (io) {
-    io.emit("price", payload);
-    io.to("global:prices").emit("price", payload);
+    io.to("global:prices").emit("price", {
+      key: "SOL_USD",
+      price: solUsd,
+      updated_at: now(),
+    });
+
+    io.to("global:prices").emit("price", {
+      key: "USDC_USD",
+      price: usdcUsd,
+      updated_at: now(),
+    });
   }
 
-  return priceUsd;
+  console.log(`[prices] SOL_USD $${solUsd} USDC_USD $${usdcUsd}`);
+  return { solUsd, usdcUsd };
 }
 
 function startSolPricePoller(io = null) {
@@ -1346,7 +1462,7 @@ function startWebsocket(io = null) {
 
       pingTimer = setInterval(() => {
         try { ws.ping(); } catch (_) {}
-      }, 60000);
+      }, PRICE_REFRESH_MS);
 
       ws.send(JSON.stringify({
         jsonrpc: "2.0",
@@ -1421,7 +1537,7 @@ async function simulateBuy(mint, quoteInUi) {
     const sold = toBigIntMaybe(token.tokens_sold, 0n);
     const solCollected = toBigIntMaybe(db.prepare(`SELECT sol_collected FROM launches WHERE mint=?`).get(mint)?.sol_collected, 0n);
     const x = V_SOL_LAMPORTS + solCollected;
-    const y = V_TOK_BASE + (SALE_SUPPLY_BASE - sold || tokensRemaining);
+    const y = V_TOK_BASE + tokensRemaining;
     const k = x * y;
     const newX = x + net;
     const newY = k / newX;

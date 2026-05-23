@@ -889,6 +889,17 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
   `).all(mint, since, since, cappedLimit).reverse();
 }
 
+
+function isSaneMoonzPriceUsd(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 && n < 10;
+}
+
+function isSaneMoonzPriceSol(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 && n < 1;
+}
+
 function quoteBaseToUiForAsset(base, quoteAsset) {
   const n = Number(base || 0);
 
