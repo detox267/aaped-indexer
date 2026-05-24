@@ -508,6 +508,12 @@ function minuteBucket(ts) {
   return Math.floor(Number(ts || now()) / 60) * 60;
 }
 
+function sanePositiveNumber(value) {
+  const n = Number(value);
+
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function upsertCandle1m({
   mint,
   ts,
@@ -519,7 +525,12 @@ function upsertCandle1m({
   volumeTokens,
   side,
 }) {
-  if (!mint || !Number.isFinite(priceSol) || priceSol <= 0) return null;
+  const cleanPriceSol = sanePositiveNumber(priceSol);
+  const cleanPriceUsd = priceUsd === null || priceUsd === undefined
+    ? null
+    : sanePositiveNumber(priceUsd);
+
+  if (!mint || !cleanPriceSol) return null;
 
   const bucket = minuteBucket(ts);
   const existing = db
@@ -541,14 +552,14 @@ function upsertCandle1m({
     `).run(
       mint,
       bucket,
-      priceSol,
-      priceSol,
-      priceSol,
-      priceSol,
-      priceUsd ?? null,
-      priceUsd ?? null,
-      priceUsd ?? null,
-      priceUsd ?? null,
+      cleanPriceSol,
+      cleanPriceSol,
+      cleanPriceSol,
+      cleanPriceSol,
+      cleanPriceUsd,
+      cleanPriceUsd,
+      cleanPriceUsd,
+      cleanPriceUsd,
       volumeQuote || 0,
       volumeSol || 0,
       volumeUsd || 0,
@@ -559,17 +570,23 @@ function upsertCandle1m({
       now()
     );
   } else {
-    const highSol = Math.max(existing.high_sol ?? priceSol, priceSol);
-    const lowSol = Math.min(existing.low_sol ?? priceSol, priceSol);
+    const existingHighSol = sanePositiveNumber(existing.high_sol) || cleanPriceSol;
+    const existingLowSol = sanePositiveNumber(existing.low_sol) || cleanPriceSol;
+    const existingHighUsd = sanePositiveNumber(existing.high_usd);
+    const existingLowUsd = sanePositiveNumber(existing.low_usd);
+
+    const highSol = Math.max(existingHighSol, cleanPriceSol);
+    const lowSol = Math.min(existingLowSol, cleanPriceSol);
+
     const highUsd =
-      priceUsd == null
-        ? existing.high_usd
-        : Math.max(existing.high_usd ?? priceUsd, priceUsd);
+      cleanPriceUsd == null
+        ? existingHighUsd
+        : Math.max(existingHighUsd || cleanPriceUsd, cleanPriceUsd);
 
     const lowUsd =
-      priceUsd == null
-        ? existing.low_usd
-        : Math.min(existing.low_usd ?? priceUsd, priceUsd);
+      cleanPriceUsd == null
+        ? existingLowUsd
+        : Math.min(existingLowUsd || cleanPriceUsd, cleanPriceUsd);
 
     db.prepare(`
       UPDATE candles_1m
@@ -587,10 +604,10 @@ function upsertCandle1m({
     `).run(
       highSol,
       lowSol,
-      priceSol,
+      cleanPriceSol,
       highUsd,
       lowUsd,
-      priceUsd ?? existing.close_usd,
+      cleanPriceUsd ?? sanePositiveNumber(existing.close_usd),
       volumeQuote || 0,
       volumeSol || 0,
       volumeUsd || 0,
@@ -648,20 +665,15 @@ function get24hPriceChange(mint) {
     LIMIT 1
   `).get(mint, since);
 
-  // If token is newer than 24h, compare against the first known candle.
+  // If token is newer than 24h, do not show a fake 24h move from the
+  // first bootstrap candle. Keep change neutral until a real 24h baseline exists.
   if (!old) {
-    old = db.prepare(`
-      SELECT open_usd AS close_usd, open_sol AS close_sol, bucket_ts
-      FROM candles_1m
-      WHERE mint = ?
-        AND bucket_ts >= ?
-        AND (
-          open_usd IS NOT NULL
-          OR open_sol IS NOT NULL
-        )
-      ORDER BY bucket_ts ASC
-      LIMIT 1
-    `).get(mint, since);
+    return {
+      price_change_24h_percent: 0,
+      price_change_24h_usd: 0,
+      price_24h_ago_usd: currentUsd > 0 ? currentUsd : null,
+      price_24h_ago_sol: currentSol > 0 ? currentSol : null,
+    };
   }
 
   const oldUsd = Number(old?.close_usd || 0);
@@ -749,7 +761,7 @@ function getToken(mint) {
       l.pinata_cid AS launch_pinata_cid,
 
       l.launch_ts AS launch_ts,
-      l.launch_ts AS created_at
+      COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
 
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
@@ -776,12 +788,12 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
         l.pinata_cid AS launch_pinata_cid,
 
         l.launch_ts AS launch_ts,
-        l.launch_ts AS created_at
+        COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
 
       FROM token_stats ts
       LEFT JOIN launches l ON l.mint = ts.mint
       WHERE ts.phase = ?
-      ORDER BY COALESCE(l.launch_ts, ts.updated_at) DESC
+      ORDER BY COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) DESC
       LIMIT ? OFFSET ?
     `).all(phase, cappedLimit, safeOffset);
   }
@@ -800,11 +812,11 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
       l.pinata_cid AS launch_pinata_cid,
 
       l.launch_ts AS launch_ts,
-      l.launch_ts AS created_at
+      COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
 
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
-    ORDER BY COALESCE(l.launch_ts, ts.updated_at) DESC
+    ORDER BY COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) DESC
     LIMIT ? OFFSET ?
   `).all(cappedLimit, safeOffset);
 }
@@ -848,7 +860,16 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
       WITH base AS (
         SELECT *, (bucket_ts / ?) * ? AS tf_bucket
         FROM candles_1m
-        WHERE mint = ? AND (? IS NULL OR bucket_ts >= ?)
+        WHERE mint = ?
+          AND (? IS NULL OR bucket_ts >= ?)
+          AND open_sol IS NOT NULL
+          AND high_sol IS NOT NULL
+          AND low_sol IS NOT NULL
+          AND close_sol IS NOT NULL
+          AND open_sol > 0
+          AND high_sol > 0
+          AND low_sol > 0
+          AND close_sol > 0
       ), ranked AS (
         SELECT *,
           ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts ASC) AS rn_open,
@@ -883,7 +904,16 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
 
   return db.prepare(`
     SELECT * FROM candles_1m
-    WHERE mint = ? AND (? IS NULL OR bucket_ts >= ?)
+    WHERE mint = ?
+      AND (? IS NULL OR bucket_ts >= ?)
+      AND open_sol IS NOT NULL
+      AND high_sol IS NOT NULL
+      AND low_sol IS NOT NULL
+      AND close_sol IS NOT NULL
+      AND open_sol > 0
+      AND high_sol > 0
+      AND low_sol > 0
+      AND close_sol > 0
     ORDER BY bucket_ts DESC
     LIMIT ?
   `).all(mint, since, since, cappedLimit).reverse();
@@ -952,7 +982,7 @@ function getCreatorTokens(address) {
       l.pinata_cid AS launch_pinata_cid,
 
       l.launch_ts AS launch_ts,
-      l.launch_ts AS created_at
+      COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
 
     FROM launches l
     LEFT JOIN token_stats ts ON ts.mint = l.mint
