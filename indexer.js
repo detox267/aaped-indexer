@@ -61,6 +61,13 @@ const LP_SUPPLY_BASE = BigInt(process.env.LP_SUPPLY_BASE || String(LP_SUPPLY_TOK
 const V_SOL_LAMPORTS = BigInt(process.env.V_SOL_LAMPORTS || String(117 * LAMPORTS_PER_SOL));
 const V_TOK_BASE = BigInt(process.env.V_TOK_BASE || String(760_000_000 * TOKEN_SCALE));
 
+function initialVirtualCurvePriceSol() {
+  const virtualSolUi = Number(V_SOL_LAMPORTS) / LAMPORTS_PER_SOL;
+  const virtualTokenUi = Number(V_TOK_BASE + SALE_SUPPLY_BASE) / TOKEN_SCALE;
+
+  return virtualTokenUi > 0 ? virtualSolUi / virtualTokenUi : 0;
+}
+
 const TRADE_FEE_BPS = Number(process.env.TRADE_FEE_BPS || 125);
 
 const WSOL_MINT = process.env.WSOL_MINT || "So11111111111111111111111111111111111111112";
@@ -1183,11 +1190,24 @@ const holdersCount = updateHolderBalancesFromDeltas({
       ? Number(refreshed.stats.price_usd)
       : price.priceUsd;
 
+  const isDevBuyCandle = String(side || "").toUpperCase().includes("DEVBUY");
+
+  const candleOpenSol = isDevBuyCandle
+    ? initialVirtualCurvePriceSol()
+    : null;
+
+  const candleOpenUsd =
+    isDevBuyCandle && candleOpenSol > 0 && candlePriceSol > 0 && candlePriceUsd > 0
+      ? candleOpenSol * (candlePriceUsd / candlePriceSol)
+      : null;
+
   const candle = upsertCandle1m({
     mint,
     ts: createdAt,
     priceSol: candlePriceSol,
     priceUsd: candlePriceUsd,
+    openPriceSol: candleOpenSol,
+    openPriceUsd: candleOpenUsd,
     volumeQuote,
     volumeSol,
     volumeUsd,

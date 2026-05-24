@@ -519,6 +519,8 @@ function upsertCandle1m({
   ts,
   priceSol,
   priceUsd,
+  openPriceSol = null,
+  openPriceUsd = null,
   volumeQuote,
   volumeSol,
   volumeUsd,
@@ -531,6 +533,9 @@ function upsertCandle1m({
     : sanePositiveNumber(priceUsd);
 
   if (!mint || !cleanPriceSol) return null;
+
+  const cleanOpenSol = sanePositiveNumber(openPriceSol) || cleanPriceSol;
+  const cleanOpenUsd = sanePositiveNumber(openPriceUsd) || cleanPriceUsd;
 
   const bucket = minuteBucket(ts);
   const existing = db
@@ -552,13 +557,17 @@ function upsertCandle1m({
     `).run(
       mint,
       bucket,
+      cleanOpenSol,
+      Math.max(cleanOpenSol, cleanPriceSol),
+      Math.min(cleanOpenSol, cleanPriceSol),
       cleanPriceSol,
-      cleanPriceSol,
-      cleanPriceSol,
-      cleanPriceSol,
-      cleanPriceUsd,
-      cleanPriceUsd,
-      cleanPriceUsd,
+      cleanOpenUsd,
+      cleanOpenUsd == null || cleanPriceUsd == null
+        ? cleanOpenUsd ?? cleanPriceUsd
+        : Math.max(cleanOpenUsd, cleanPriceUsd),
+      cleanOpenUsd == null || cleanPriceUsd == null
+        ? cleanOpenUsd ?? cleanPriceUsd
+        : Math.min(cleanOpenUsd, cleanPriceUsd),
       cleanPriceUsd,
       volumeQuote || 0,
       volumeSol || 0,
