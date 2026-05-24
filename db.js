@@ -534,13 +534,36 @@ function upsertCandle1m({
 
   if (!mint || !cleanPriceSol) return null;
 
-  const cleanOpenSol = sanePositiveNumber(openPriceSol) || cleanPriceSol;
-  const cleanOpenUsd = sanePositiveNumber(openPriceUsd) || cleanPriceUsd;
+  const explicitOpenSol = sanePositiveNumber(openPriceSol);
+  const explicitOpenUsd = sanePositiveNumber(openPriceUsd);
 
   const bucket = minuteBucket(ts);
   const existing = db
     .prepare(`SELECT * FROM candles_1m WHERE mint = ? AND bucket_ts = ?`)
     .get(mint, bucket);
+
+  const previous = !existing
+    ? db.prepare(`
+        SELECT close_sol, close_usd
+        FROM candles_1m
+        WHERE mint = ?
+          AND bucket_ts < ?
+          AND close_sol IS NOT NULL
+          AND close_sol > 0
+        ORDER BY bucket_ts DESC
+        LIMIT 1
+      `).get(mint, bucket)
+    : null;
+
+  const cleanOpenSol =
+    explicitOpenSol ||
+    sanePositiveNumber(previous?.close_sol) ||
+    cleanPriceSol;
+
+  const cleanOpenUsd =
+    explicitOpenUsd ||
+    sanePositiveNumber(previous?.close_usd) ||
+    cleanPriceUsd;
 
   const isBuy = side === "BUY" || side === "DEVBUY" || side === "AMM_BUY";
   const isSell = side === "SELL" || side === "AMM_SELL";
