@@ -1190,7 +1190,24 @@ const holdersCount = updateHolderBalancesFromDeltas({
       ? Number(refreshed.stats.price_usd)
       : price.priceUsd;
 
-  const isDevBuyCandle = String(side || "").toUpperCase().includes("DEVBUY");
+  const sideUpper = String(side || "").toUpperCase();
+
+  const hasExistingCandles = db.prepare(`
+    SELECT 1
+    FROM candles_1m
+    WHERE mint = ?
+    LIMIT 1
+  `).get(mint);
+
+  // Program rule: every launch has a mandatory dev buy to start the curve.
+  // Some decoded events label that first dev buy as BUY instead of DEVBUY.
+  // So the first BUY-like candle for a mint must open from the virtual curve start.
+  const isFirstBuyCandle =
+    !hasExistingCandles &&
+    (sideUpper.includes("BUY") || sideUpper.includes("DEVBUY"));
+
+  const isDevBuyCandle =
+    sideUpper.includes("DEVBUY") || isFirstBuyCandle;
 
   const candleOpenSol = isDevBuyCandle
     ? initialVirtualCurvePriceSol()
