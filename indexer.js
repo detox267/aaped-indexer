@@ -86,7 +86,7 @@ const ENABLE_GLOBAL_EVENTS = process.env.ENABLE_GLOBAL_EVENTS === "true";
 const ENABLE_LIVE_REDIS = process.env.ENABLE_LIVE_REDIS !== "false";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const LIVE_EVENT_CHANNEL = process.env.LIVE_EVENT_CHANNEL || "moonz:events";
-const LIVE_STATS_DEDUPE_MS = Number(process.env.LIVE_STATS_DEDUPE_MS || 3500);
+const LIVE_STATS_DEDUPE_MS = Number(process.env.LIVE_STATS_DEDUPE_MS || 10_000);
 
 const STARTUP_BACKFILL_SIGNATURES = Number(process.env.STARTUP_BACKFILL_SIGNATURES || 0);
 const TX_FETCH_RETRIES = Number(process.env.TX_FETCH_RETRIES || 8);
@@ -124,6 +124,7 @@ function stringifySafe(value) {
 let liveRedisClient = null;
 let liveRedisConnecting = null;
 let lastLiveRedisErrorAt = 0;
+let livePublishQueue = Promise.resolve();
 const liveEventDedupe = new Map();
 
 async function getLiveRedisClient() {
@@ -359,9 +360,11 @@ function publishLiveEvent(event) {
     emitted_at: now(),
   });
 
-  getLiveRedisClient()
-    .then((client) => {
+  livePublishQueue = livePublishQueue
+    .then(async () => {
+      const client = await getLiveRedisClient();
       if (!client) return null;
+
       return client.publish(LIVE_EVENT_CHANNEL, payload);
     })
     .catch((err) => {
@@ -445,7 +448,7 @@ function compactHomepageToken(stats = {}) {
     mint: stats.mint,
     name: stats.name || stats.launch_name || null,
     symbol: stats.symbol || stats.launch_symbol || null,
-    image: stats.image || stats.launch_image || null,
+    image: stats.mint ? indexerMediaUrl(stats.mint, "thumb") : (stats.image || stats.launch_image || null),
     creator: stats.creator || null,
 
     phase: stats.phase,
@@ -561,9 +564,13 @@ async function fetchLaunchMetadataFromApi(mint) {
   }
 }
 
-function indexerMediaUrl(mint) {
+function indexerMediaUrl(mint, variant = "") {
   if (!mint) return null;
-  return `${PUBLIC_INDEXER_BASE.replace(/\/+$/, "")}/media/token/${encodeURIComponent(mint)}`;
+
+  const base = `${PUBLIC_INDEXER_BASE.replace(/\/+$/, "")}/media/token/${encodeURIComponent(mint)}`;
+  const cleanVariant = String(variant || "").replace(/^\/+|\/+$/g, "");
+
+  return cleanVariant ? `${base}/${cleanVariant}` : base;
 }
 
 function toBase58Maybe(value) {
