@@ -1174,12 +1174,12 @@ const holdersCount = updateHolderBalancesFromDeltas({
   // the execution price. This prevents the first candle from drawing a scary
   // vertical start bar while the token is still just bootstrapping.
   const candlePriceSol =
-    side === "DEVBUY" && Number(refreshed?.stats?.price_sol || 0) > 0
+    String(side || "").toUpperCase().includes("DEVBUY") && Number(refreshed?.stats?.price_sol || 0) > 0
       ? Number(refreshed.stats.price_sol)
       : price.priceSol;
 
   const candlePriceUsd =
-    side === "DEVBUY" && Number(refreshed?.stats?.price_usd || 0) > 0
+    String(side || "").toUpperCase().includes("DEVBUY") && Number(refreshed?.stats?.price_usd || 0) > 0
       ? Number(refreshed.stats.price_usd)
       : price.priceUsd;
 
