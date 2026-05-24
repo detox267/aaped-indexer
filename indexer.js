@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const WebSocket = require("ws");
+const { createClient } = require("redis");
 const anchor = require("@coral-xyz/anchor");
 const { Connection, PublicKey } = require("@solana/web3.js");
 const { loadIdl } = require("./idl");
@@ -19,6 +20,7 @@ const {
   upsertCandle1m,
   refresh24hVolume,
   getToken,
+  getCandles,
   upsertHolderBalance,
 } = require("./db");
 
@@ -80,6 +82,12 @@ const PRICE_REFRESH_MS = Number(process.env.PRICE_REFRESH_MS || 10000);
 const PLATFORM_WALLET = process.env.PLATFORM_WALLET || "ELZ5aiHLxnaTmbazgbmoSCVS6SyvJ7DbXTDxq682PuKt";
 
 const ENABLE_GLOBAL_EVENTS = process.env.ENABLE_GLOBAL_EVENTS === "true";
+
+const ENABLE_LIVE_REDIS = process.env.ENABLE_LIVE_REDIS !== "false";
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const LIVE_EVENT_CHANNEL = process.env.LIVE_EVENT_CHANNEL || "moonz:events";
+const LIVE_STATS_DEDUPE_MS = Number(process.env.LIVE_STATS_DEDUPE_MS || 3500);
+
 const STARTUP_BACKFILL_SIGNATURES = Number(process.env.STARTUP_BACKFILL_SIGNATURES || 0);
 const TX_FETCH_RETRIES = Number(process.env.TX_FETCH_RETRIES || 8);
 const TX_FETCH_DELAY_MS = Number(process.env.TX_FETCH_DELAY_MS || 750);
@@ -111,6 +119,417 @@ function stringifySafe(value) {
     }
     return val;
   });
+}
+
+let liveRedisClient = null;
+let liveRedisConnecting = null;
+let lastLiveRedisErrorAt = 0;
+const liveEventDedupe = new Map();
+
+async function getLiveRedisClient() {
+  if (!ENABLE_LIVE_REDIS) return null;
+  if (liveRedisClient?.isOpen) return liveRedisClient;
+
+  if (!liveRedisConnecting) {
+    liveRedisClient = createClient({
+      url: REDIS_URL,
+    });
+
+    liveRedisClient.on("error", (err) => {
+      const ts = Date.now();
+
+      // Prevent log spam if Redis temporarily goes away.
+      if (ts - lastLiveRedisErrorAt > 10_000) {
+        lastLiveRedisErrorAt = ts;
+        console.error("[live-redis] error:", err?.message || err);
+      }
+    });
+
+    liveRedisConnecting = liveRedisClient.connect().catch((err) => {
+      liveRedisClient = null;
+      liveRedisConnecting = null;
+      throw err;
+    });
+  }
+
+  await liveRedisConnecting;
+
+  return liveRedisClient;
+}
+
+function liveDedupeKey(event) {
+  if (!event?.type || !event?.mint) return null;
+
+  if (event.type === "token.stats.updated") {
+    return `stats:${event.mint}`;
+  }
+
+  if (event.type === "holders.updated") {
+    return `holders:${event.mint}`;
+  }
+
+  return null;
+}
+
+function liveDedupeSignature(event) {
+  if (!event) return "";
+
+  if (event.type === "token.stats.updated") {
+    const st = event.stats || {};
+
+    return stringifySafe({
+      price_sol: st.price_sol,
+      price_usd: st.price_usd,
+      marketcap_usd: st.marketcap_usd,
+      bonding_progress: st.bonding_progress,
+      holders_count: st.holders_count,
+      volume_24h_usd: st.volume_24h_usd,
+      trades_24h: st.trades_24h,
+      tokens_sold: st.tokens_sold,
+      tokens_remaining: st.tokens_remaining,
+      phase: st.phase,
+      quote_asset: st.quote_asset,
+    });
+  }
+
+  if (event.type === "holders.updated") {
+    return stringifySafe(event.holders || {});
+  }
+
+  return stringifySafe(event);
+}
+
+function shouldPublishLiveEvent(event) {
+  const key = liveDedupeKey(event);
+  if (!key) return true;
+
+  const ts = Date.now();
+  const signature = liveDedupeSignature(event);
+  const prev = liveEventDedupe.get(key);
+
+  if (prev && prev.signature === signature && ts - prev.ts < LIVE_STATS_DEDUPE_MS) {
+    return false;
+  }
+
+  liveEventDedupe.set(key, {
+    ts,
+    signature,
+  });
+
+  if (liveEventDedupe.size > 5000) {
+    const firstKey = liveEventDedupe.keys().next().value;
+    if (firstKey) liveEventDedupe.delete(firstKey);
+  }
+
+  return true;
+}
+
+function compactLiveStats(stats = {}) {
+  if (!stats) return null;
+
+  return {
+    mint: stats.mint,
+    name: stats.name || null,
+    symbol: stats.symbol || null,
+    image: stats.image || null,
+
+    phase: stats.phase,
+    quote_asset: stats.quote_asset,
+
+    price_sol: stats.price_sol,
+    price_usd: stats.price_usd,
+    marketcap_sol: stats.marketcap_sol,
+    marketcap_usd: stats.marketcap_usd,
+
+    bonding_progress: stats.bonding_progress,
+    holders_count: stats.holders_count,
+
+    volume_24h_sol: stats.volume_24h_sol,
+    volume_24h_usd: stats.volume_24h_usd,
+    trades_24h: stats.trades_24h,
+
+    tokens_sold: stats.tokens_sold,
+    tokens_remaining: stats.tokens_remaining,
+
+    price_change_24h_percent: stats.price_change_24h_percent,
+    price_change_24h_usd: stats.price_change_24h_usd,
+
+    last_trade_ts: stats.last_trade_ts,
+    updated_at: stats.updated_at,
+  };
+}
+
+function compactLiveTrade(trade = {}) {
+  if (!trade) return null;
+
+  return {
+    sig: trade.sig,
+    slot: trade.slot,
+    block_time: trade.block_time,
+
+    mint: trade.mint,
+    user: trade.user,
+    side: trade.side,
+
+    phase: trade.phase,
+    quote_asset: trade.quote_asset,
+
+    input_amount: trade.input_amount,
+    input_mint: trade.input_mint,
+    output_amount: trade.output_amount,
+    output_mint: trade.output_mint,
+
+    quote_amount: trade.quote_amount,
+    token_amount: trade.token_amount,
+
+    price_sol: trade.price_sol ?? trade.priceSol,
+    price_usd: trade.price_usd ?? trade.priceUsd,
+
+    created_at: trade.created_at ?? trade.createdAt,
+  };
+}
+
+function compactLiveEvent(event) {
+  if (!event || !event.type) return event;
+
+  if (event.type === "token.stats.updated") {
+    return {
+      type: event.type,
+      mint: event.mint,
+      stats: compactLiveStats(event.stats),
+    };
+  }
+
+  if (event.type === "trade.created") {
+    return {
+      type: event.type,
+      mint: event.mint,
+      trade: compactLiveTrade(event.trade),
+    };
+  }
+
+  if (event.type === "homepage.recent_buy") {
+    return {
+      type: event.type,
+      mint: event.mint,
+      token: compactHomepageToken(event.token || event.stats),
+      trade: compactLiveTrade(event.trade),
+    };
+  }
+
+  if (event.type === "candle.updated") {
+    return {
+      type: event.type,
+      mint: event.mint,
+      interval: event.interval || event.candle?.interval || "15m",
+      candle: compactCandle(
+        event.candle,
+        event.interval || event.candle?.interval || "15m"
+      ),
+    };
+  }
+
+  if (event.type === "holders.updated") {
+    return {
+      type: event.type,
+      mint: event.mint,
+      holders: event.holders
+        ? {
+            mint: event.holders.mint || event.mint,
+            holders: event.holders.holders,
+            holders_count: event.holders.holders_count,
+            updated_at: event.holders.updated_at,
+          }
+        : null,
+    };
+  }
+
+  return event;
+}
+
+function publishLiveEvent(event) {
+  if (!ENABLE_LIVE_REDIS || !event?.type) return;
+
+  const compactEvent = compactLiveEvent(event);
+
+  if (!shouldPublishLiveEvent(compactEvent)) return;
+
+  const payload = stringifySafe({
+    ...compactEvent,
+    emitted_at: now(),
+  });
+
+  getLiveRedisClient()
+    .then((client) => {
+      if (!client) return null;
+      return client.publish(LIVE_EVENT_CHANNEL, payload);
+    })
+    .catch((err) => {
+      const ts = Date.now();
+
+      // Live events must never break indexing.
+      if (ts - lastLiveRedisErrorAt > 10_000) {
+        lastLiveRedisErrorAt = ts;
+        console.error("[live-redis] publish failed:", err?.message || err);
+      }
+    });
+}
+
+function latestCandle(mint, interval = "15m") {
+  try {
+    return getCandles({
+      mint,
+      interval,
+      limit: 1,
+    })?.[0] || null;
+  } catch (err) {
+    console.warn(`[live-redis] latest ${interval} candle failed for ${mint}:`, err?.message || err);
+    return null;
+  }
+}
+
+function compactStats(stats = {}) {
+  if (!stats) return null;
+
+  return {
+    mint: stats.mint,
+    name: stats.name || stats.launch_name || null,
+    symbol: stats.symbol || stats.launch_symbol || null,
+    image: stats.image || stats.launch_image || null,
+    metadata_uri: stats.metadata_uri || stats.launch_metadata_uri || null,
+
+    creator: stats.creator || null,
+
+    phase: stats.phase,
+    phase_u8: stats.phase_u8,
+    quote_asset: stats.quote_asset,
+    quote_asset_u8: stats.quote_asset_u8,
+
+    price_quote: stats.price_quote,
+    price_sol: stats.price_sol,
+    price_usd: stats.price_usd,
+
+    marketcap_quote: stats.marketcap_quote,
+    marketcap_sol: stats.marketcap_sol,
+    marketcap_usd: stats.marketcap_usd,
+
+    bonding_progress: stats.bonding_progress,
+    holders_count: stats.holders_count,
+
+    volume_24h_quote: stats.volume_24h_quote,
+    volume_24h_sol: stats.volume_24h_sol,
+    volume_24h_usd: stats.volume_24h_usd,
+    trades_24h: stats.trades_24h,
+
+    tokens_sold: stats.tokens_sold,
+    tokens_remaining: stats.tokens_remaining,
+    total_supply: stats.total_supply,
+    sale_supply: stats.sale_supply,
+    lp_supply: stats.lp_supply,
+
+    price_change_24h_percent: stats.price_change_24h_percent,
+    price_change_24h_usd: stats.price_change_24h_usd,
+    price_24h_ago_usd: stats.price_24h_ago_usd,
+    price_24h_ago_sol: stats.price_24h_ago_sol,
+
+    last_trade_ts: stats.last_trade_ts,
+    created_at: stats.created_at,
+    updated_at: stats.updated_at,
+  };
+}
+
+function compactHomepageToken(stats = {}) {
+  if (!stats) return null;
+
+  return {
+    mint: stats.mint,
+    name: stats.name || stats.launch_name || null,
+    symbol: stats.symbol || stats.launch_symbol || null,
+    image: stats.image || stats.launch_image || null,
+    creator: stats.creator || null,
+
+    phase: stats.phase,
+    quote_asset: stats.quote_asset,
+
+    price_sol: stats.price_sol,
+    price_usd: stats.price_usd,
+    marketcap_usd: stats.marketcap_usd,
+    bonding_progress: stats.bonding_progress,
+
+    holders_count: stats.holders_count,
+    volume_24h_usd: stats.volume_24h_usd,
+    trades_24h: stats.trades_24h,
+
+    updated_at: stats.updated_at,
+    created_at: stats.created_at,
+  };
+}
+
+function compactTrade(trade = {}) {
+  if (!trade) return null;
+
+  return {
+    sig: trade.sig,
+    slot: trade.slot,
+    block_time: trade.block_time,
+    log_index: trade.log_index,
+
+    mint: trade.mint,
+    user: trade.user,
+    side: trade.side,
+
+    phase: trade.phase,
+    phase_u8: trade.phase_u8,
+    quote_asset: trade.quote_asset,
+    quote_asset_u8: trade.quote_asset_u8,
+
+    input_amount: trade.input_amount,
+    input_mint: trade.input_mint,
+    output_amount: trade.output_amount,
+    output_mint: trade.output_mint,
+
+    quote_amount: trade.quote_amount,
+    token_amount: trade.token_amount,
+
+    price_quote: trade.price_quote,
+    price_sol: trade.price_sol,
+    price_usd: trade.price_usd,
+    priceSol: trade.priceSol,
+    priceUsd: trade.priceUsd,
+
+    created_at: trade.created_at,
+    createdAt: trade.createdAt,
+  };
+}
+
+function compactCandle(candle = {}, interval = "15m") {
+  if (!candle) return null;
+
+  return {
+    interval,
+    mint: candle.mint,
+    bucket_ts: candle.bucket_ts,
+
+    open_sol: candle.open_sol,
+    high_sol: candle.high_sol,
+    low_sol: candle.low_sol,
+    close_sol: candle.close_sol,
+
+    open_usd: candle.open_usd,
+    high_usd: candle.high_usd,
+    low_usd: candle.low_usd,
+    close_usd: candle.close_usd,
+
+    volume_quote: candle.volume_quote,
+    volume_sol: candle.volume_sol,
+    volume_usd: candle.volume_usd,
+    volume_tokens: candle.volume_tokens,
+
+    trades_count: candle.trades_count,
+    buys_count: candle.buys_count,
+    sells_count: candle.sells_count,
+    updated_at: candle.updated_at,
+  };
 }
 
 async function fetchLaunchMetadataFromApi(mint) {
@@ -643,6 +1062,11 @@ async function refreshMintState(mint, io = null) {
     last_trade_ts: Number(state.lastTradeTs || 0n) || null,
   });
 
+  // Do not publish refreshMintState() stats to Redis.
+  // refreshMintState() can run from page refreshes, health checks, recovery,
+  // background sync, and token reads. Publishing here creates duplicate/noisy
+  // live events. Redis live stats are published from the trade path after the
+  // trade/candle/volume DB writes are complete.
   if (io && stats) {
     io.to(`mint:${mint}`).emit("stats", stats);
     io.to(`mint:${mint}:stats`).emit("stats", stats);
@@ -1241,6 +1665,81 @@ const holdersCount = updateHolderBalancesFromDeltas({
     createdAt,
   };
 
+  publishLiveEvent({
+    type: "trade.created",
+    mint,
+    trade: payload,
+  });
+
+  if (candle) {
+    publishLiveEvent({
+      type: "candle.updated",
+      mint,
+      interval: "1m",
+      candle: {
+        interval: "1m",
+        ...candle,
+      },
+    });
+
+    const candle15m = latestCandle(mint, "15m");
+
+    if (candle15m) {
+      publishLiveEvent({
+        type: "candle.updated",
+        mint,
+        interval: "15m",
+        candle: compactCandle(candle15m, "15m"),
+      });
+    }
+  }
+
+  if (stats) {
+    publishLiveEvent({
+      type: "token.stats.updated",
+      mint,
+      stats: compactStats(stats),
+    });
+  }
+
+  if (holdersCount !== undefined) {
+    publishLiveEvent({
+      type: "holders.updated",
+      mint,
+      holders: {
+        mint,
+        holders: holdersCount,
+        holders_count: holdersCount,
+        updated_at: createdAt,
+      },
+    });
+  }
+
+  if (String(side || "").toUpperCase().includes("BUY")) {
+    const compactLiveStats = compactStats(stats || getToken(mint));
+
+    publishLiveEvent({
+      type: "homepage.recent_buy",
+      mint,
+      token: compactHomepageToken(compactLiveStats),
+      trade: {
+        sig: payload.sig,
+        mint,
+        user: payload.user,
+        side: payload.side,
+        quote_asset: payload.quote_asset,
+        quote_amount: payload.quote_amount,
+        token_amount: payload.token_amount,
+        price_sol: payload.price_sol,
+        price_usd: payload.price_usd,
+        priceSol: payload.priceSol,
+        priceUsd: payload.priceUsd,
+        created_at: payload.created_at,
+        createdAt: payload.createdAt,
+      },
+    });
+  }
+
   if (io) {
     io.to("global:trades").emit("trade", payload);
     io.to(`mint:${mint}`).emit("trade", payload);
@@ -1320,6 +1819,14 @@ async function handleEvent({ sig, slot, tx, event, logIndex, io }) {
     user,
     payload: JSON.parse(stringifySafe(event.data)),
   };
+
+  if (ENABLE_GLOBAL_EVENTS || isLaunchLikeEvent(event.name)) {
+    publishLiveEvent({
+      type: "event.created",
+      mint,
+      event: raw,
+    });
+  }
 
   if (io) {
     if (ENABLE_GLOBAL_EVENTS || isLaunchLikeEvent(event.name)) {
@@ -1619,6 +2126,7 @@ async function simulateBuy(mint, quoteInUi) {
 async function startIndexer({ io = null } = {}) {
   console.log("Starting Moonz indexer");
   console.log("Program:", PROGRAM_ID);
+  console.log("Live Redis:", ENABLE_LIVE_REDIS ? `${REDIS_URL} / ${LIVE_EVENT_CHANNEL}` : "disabled");
   console.log("RPC:", RPC_URL);
   console.log("WS:", HELIUS_WSS.replace(/api-key=.*/, "api-key=***"));
   console.log(`Curve constants: V_SOL=${Number(V_SOL_LAMPORTS) / LAMPORTS_PER_SOL}, V_TOK=${Number(V_TOK_BASE) / TOKEN_SCALE}`);
