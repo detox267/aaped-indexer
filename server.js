@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const fetch = globalThis.fetch || require("node-fetch");
+const sharp = require("sharp");
 
 const express = require("express");
 const http = require("http");
@@ -52,6 +53,50 @@ function safeImageExt(contentType = "") {
   return ".jpg";
 }
 
+const MEDIA_VARIANTS = {
+  thumb: {
+    size: Number(process.env.MEDIA_THUMB_SIZE || 96),
+    quality: Number(process.env.MEDIA_THUMB_QUALITY || 76),
+  },
+  card: {
+    size: Number(process.env.MEDIA_CARD_SIZE || 160),
+    quality: Number(process.env.MEDIA_CARD_QUALITY || 78),
+  },
+  default: {
+    size: Number(process.env.MEDIA_DEFAULT_SIZE || 256),
+    quality: Number(process.env.MEDIA_DEFAULT_QUALITY || 80),
+  },
+};
+
+function mediaVariant(value) {
+  const key = String(value || "default").toLowerCase();
+
+  if (key === "thumb") return "thumb";
+  if (key === "card") return "card";
+
+  return "default";
+}
+
+async function makeTokenImageWebp(buffer, variant = "default") {
+  const cfg = MEDIA_VARIANTS[variant] || MEDIA_VARIANTS.default;
+
+  return sharp(buffer, {
+    animated: false,
+    limitInputPixels: 16_000_000,
+  })
+    .rotate()
+    .resize(cfg.size, cfg.size, {
+      fit: "cover",
+      position: "center",
+      withoutEnlargement: false,
+    })
+    .webp({
+      quality: cfg.quality,
+      effort: 4,
+    })
+    .toBuffer();
+}
+
 function mediaCacheKey(input) {
   return crypto.createHash("sha256").update(String(input)).digest("hex");
 }
@@ -86,9 +131,10 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/media/token/:mint", async (req, res) => {
+app.get(["/media/token/:mint", "/media/token/:mint/:variant"], async (req, res) => {
   try {
     const mint = req.params.mint;
+    const variant = mediaVariant(req.params.variant);
 
     const row = db
       .prepare(`
@@ -135,17 +181,15 @@ app.get("/media/token/:mint", async (req, res) => {
       return res.status(404).json({ error: "Invalid token image" });
     }
 
-    const key = mediaCacheKey(imageUrl);
+    const key = mediaCacheKey(`${variant}:${imageUrl}`);
+    const cachedFile = `${key}.webp`;
+    const cachedPath = path.join(MEDIA_CACHE_DIR, cachedFile);
 
-    const cachedFile = fs
-      .readdirSync(MEDIA_CACHE_DIR)
-      .find((file) => file.startsWith(`${key}.`));
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.setHeader("Content-Type", "image/webp");
+    res.setHeader("X-Content-Type-Options", "nosniff");
 
-    if (cachedFile) {
-      const cachedPath = path.join(MEDIA_CACHE_DIR, cachedFile);
-
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-
+    if (fs.existsSync(cachedPath)) {
       return res.sendFile(cachedPath);
     }
 
@@ -157,19 +201,24 @@ app.get("/media/token/:mint", async (req, res) => {
       });
     }
 
-    const contentType = imageRes.headers.get("content-type") || "image/jpeg";
-    const ext = safeImageExt(contentType);
-    const filePath = path.join(MEDIA_CACHE_DIR, `${key}${ext}`);
-
     const arrayBuffer = await imageRes.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const inputBuffer = Buffer.from(arrayBuffer);
 
-    fs.writeFileSync(filePath, buffer);
+    let outputBuffer;
 
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    try {
+      outputBuffer = await makeTokenImageWebp(inputBuffer, variant);
+    } catch (err) {
+      console.error(`image compression failed for ${mint}:`, err?.message || err);
 
-    return res.send(buffer);
+      return res.status(415).json({
+        error: "Token image could not be processed",
+      });
+    }
+
+    fs.writeFileSync(cachedPath, outputBuffer);
+
+    return res.send(outputBuffer);
   } catch (err) {
     console.error("media token image error:", err);
     return res.status(500).json({ error: "Failed to load token image" });
