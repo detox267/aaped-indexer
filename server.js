@@ -43,6 +43,11 @@ const AVATAR_CACHE_DIR =
 const IPFS_GATEWAY =
   process.env.IPFS_GATEWAY || "https://gateway.pinata.cloud/ipfs";
 
+const PUBLIC_INDEXER_BASE_URL =
+  process.env.PUBLIC_INDEXER_BASE_URL ||
+  process.env.PUBLIC_INDEXER_BASE ||
+  "https://indexer.moonz.fun";
+
 fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
 fs.mkdirSync(AVATAR_CACHE_DIR, { recursive: true });
 
@@ -245,9 +250,8 @@ function cleanWallet(value) {
   return String(value || "").trim();
 }
 
-function publicAvatarUrl(req, wallet) {
-  const base = `${req.protocol}://${req.get("host")}`;
-  return `${base}/media/avatar/${encodeURIComponent(wallet)}`;
+function publicAvatarUrl(_req, wallet) {
+  return `${PUBLIC_INDEXER_BASE_URL.replace(/\/+$/, "")}/media/avatar/${encodeURIComponent(wallet)}`;
 }
 
 function parseDataUrlImage(value) {
