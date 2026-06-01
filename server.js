@@ -20,6 +20,16 @@ const {
   getHolderSummary,
   getTopHolders,
   getCreatorProfile,
+  normalizeUsername,
+  getUserProfile,
+  getUserProfileByUsername,
+  isUsernameAvailable,
+  upsertUserProfile,
+  followUser,
+  unfollowUser,
+  isFollowing,
+  listFollowers,
+  listFollowing,
 } = require("./db");
 
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
@@ -27,10 +37,14 @@ const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
 const MEDIA_CACHE_DIR =
   process.env.MEDIA_CACHE_DIR || "/root/aaped-indexer/media-cache";
 
+const AVATAR_CACHE_DIR =
+  process.env.AVATAR_CACHE_DIR || path.join(MEDIA_CACHE_DIR, "profile-avatars");
+
 const IPFS_GATEWAY =
   process.env.IPFS_GATEWAY || "https://gateway.pinata.cloud/ipfs";
 
 fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
+fs.mkdirSync(AVATAR_CACHE_DIR, { recursive: true });
 
 function ipfsToHttp(uri) {
   if (!uri) return null;
@@ -222,6 +236,264 @@ app.get(["/media/token/:mint", "/media/token/:mint/:variant"], async (req, res) 
   } catch (err) {
     console.error("media token image error:", err);
     return res.status(500).json({ error: "Failed to load token image" });
+  }
+});
+
+
+
+function cleanWallet(value) {
+  return String(value || "").trim();
+}
+
+function publicAvatarUrl(req, wallet) {
+  const base = `${req.protocol}://${req.get("host")}`;
+  return `${base}/media/avatar/${encodeURIComponent(wallet)}`;
+}
+
+function parseDataUrlImage(value) {
+  const raw = String(value || "");
+
+  const match = raw.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+
+  if (match) {
+    return {
+      mime: match[1],
+      buffer: Buffer.from(match[2], "base64"),
+    };
+  }
+
+  return {
+    mime: "image/jpeg",
+    buffer: Buffer.from(raw, "base64"),
+  };
+}
+
+app.get("/media/avatar/:wallet", async (req, res) => {
+  try {
+    const wallet = cleanWallet(req.params.wallet);
+    const file = path.join(AVATAR_CACHE_DIR, `${wallet}.webp`);
+
+    if (!wallet || !fs.existsSync(file)) {
+      return res.status(404).json({ error: "Avatar not found" });
+    }
+
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("Content-Type", "image/webp");
+
+    return res.sendFile(file);
+  } catch (err) {
+    console.error("avatar media error:", err);
+    return res.status(500).json({ error: "Failed to load avatar" });
+  }
+});
+
+app.get("/profile/:wallet", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.params.wallet);
+    if (!wallet) return res.status(400).json({ error: "Wallet is required" });
+
+    const profile = getUserProfile(wallet);
+
+    return res.json({
+      ok: true,
+      profile: profile || {
+        wallet,
+        username: null,
+        display_username: null,
+        display_name: null,
+        bio: null,
+        avatar_url: null,
+        follower_count: 0,
+        following_count: 0,
+      },
+    });
+  } catch (err) {
+    console.error("profile get error:", err);
+    return res.status(500).json({ error: err.message || "Failed to load profile" });
+  }
+});
+
+app.get("/u/:username", (req, res) => {
+  try {
+    const username = normalizeUsername(req.params.username);
+    const profile = getUserProfileByUsername(username);
+
+    if (!profile) {
+      return res.status(404).json({
+        ok: false,
+        error: "Username not found",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      profile,
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Invalid username",
+    });
+  }
+});
+
+app.get("/username/check/:username", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.query.wallet);
+    const result = isUsernameAvailable(req.params.username, wallet);
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Invalid username",
+    });
+  }
+});
+
+app.post("/profile", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.body.wallet);
+    if (!wallet) return res.status(400).json({ ok: false, error: "Wallet is required" });
+
+    const profile = upsertUserProfile({
+      wallet,
+      username: req.body.username,
+      display_name: req.body.display_name,
+      bio: req.body.bio,
+    });
+
+    return res.json({
+      ok: true,
+      profile,
+    });
+  } catch (err) {
+    console.error("profile save error:", err);
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to save profile",
+    });
+  }
+});
+
+app.post("/profile/avatar", async (req, res) => {
+  try {
+    const wallet = cleanWallet(req.body.wallet);
+    const image = req.body.image || req.body.image_base64 || req.body.data_url;
+
+    if (!wallet) return res.status(400).json({ ok: false, error: "Wallet is required" });
+    if (!image) return res.status(400).json({ ok: false, error: "Image is required" });
+
+    const parsed = parseDataUrlImage(image);
+
+    if (!parsed.mime.startsWith("image/")) {
+      return res.status(400).json({ ok: false, error: "Avatar must be an image" });
+    }
+
+    if (parsed.buffer.length > 3 * 1024 * 1024) {
+      return res.status(400).json({ ok: false, error: "Avatar max size is 3MB" });
+    }
+
+    const output = await sharp(parsed.buffer)
+      .rotate()
+      .resize(256, 256, {
+        fit: "cover",
+        withoutEnlargement: false,
+      })
+      .webp({ quality: 82 })
+      .toBuffer();
+
+    const file = path.join(AVATAR_CACHE_DIR, `${wallet}.webp`);
+    fs.writeFileSync(file, output);
+
+    const avatarUrl = publicAvatarUrl(req, wallet);
+
+    const profile = upsertUserProfile({
+      wallet,
+      avatar_url: avatarUrl,
+    });
+
+    return res.json({
+      ok: true,
+      avatar_url: avatarUrl,
+      profile,
+    });
+  } catch (err) {
+    console.error("avatar save error:", err);
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to save avatar",
+    });
+  }
+});
+
+app.post("/follow", (req, res) => {
+  try {
+    const follower = cleanWallet(req.body.follower_wallet || req.body.follower);
+    const following = cleanWallet(req.body.following_wallet || req.body.following);
+
+    const result = followUser(follower, following);
+
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to follow user",
+    });
+  }
+});
+
+app.post("/unfollow", (req, res) => {
+  try {
+    const follower = cleanWallet(req.body.follower_wallet || req.body.follower);
+    const following = cleanWallet(req.body.following_wallet || req.body.following);
+
+    const result = unfollowUser(follower, following);
+
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to unfollow user",
+    });
+  }
+});
+
+app.get("/profile/:wallet/followers", (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      followers: listFollowers(req.params.wallet, req.query.limit || 50),
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Failed to load followers" });
+  }
+});
+
+app.get("/profile/:wallet/following", (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      following: listFollowing(req.params.wallet, req.query.limit || 50),
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Failed to load following" });
+  }
+});
+
+app.get("/profile/:wallet/is-following/:target", (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      follower_wallet: req.params.wallet,
+      following_wallet: req.params.target,
+      following: isFollowing(req.params.wallet, req.params.target),
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Failed to check follow state" });
   }
 });
 
@@ -583,6 +855,261 @@ app.get("/debug/db-counts", (req, res) => {
 
   res.json(out);
 });
+
+
+// -----------------------------------------------------------------------------
+// King of the Moonz: current-hour top traded tokens
+// -----------------------------------------------------------------------------
+function kingParseTime(row = {}) {
+  const raw =
+    row.created_at ??
+    row.createdAt ??
+    row.timestamp ??
+    row.ts ??
+    row.time ??
+    row.block_time ??
+    row.blockTime ??
+    row.inserted_at ??
+    row.insertedAt;
+
+  if (raw === undefined || raw === null || raw === "") return 0;
+
+  if (typeof raw === "number") {
+    return raw > 10_000_000_000 ? raw : raw * 1000;
+  }
+
+  const s = String(raw).trim();
+
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return n > 10_000_000_000 ? n : n * 1000;
+  }
+
+  const parsed = new Date(s).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function kingNum(row = {}, keys = []) {
+  for (const key of keys) {
+    const v = row[key];
+    if (v === undefined || v === null || v === "") continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+
+function kingQuoteAmountUi(row = {}) {
+  const quoteAsset = String(
+    row.quote_asset ||
+    row.quoteAsset ||
+    row.quote ||
+    "SOL"
+  ).toUpperCase();
+
+  const ui = kingNum(row, [
+    "quote_amount_ui",
+    "quoteAmountUi",
+    "sol_amount_ui",
+    "solAmountUi",
+    "quote_in_ui",
+    "quoteInUi",
+    "quote_out_ui",
+    "quoteOutUi",
+  ]);
+
+  if (ui > 0) return Math.abs(ui);
+
+  const raw = Math.abs(kingNum(row, [
+    "quote_amount",
+    "quoteAmount",
+    "sol_amount",
+    "solAmount",
+    "quote_in",
+    "quoteIn",
+    "quote_out",
+    "quoteOut",
+  ]));
+
+  if (raw <= 0) return 0;
+
+  if (quoteAsset === "USDC") {
+    return raw / 1_000_000;
+  }
+
+  return raw / 1_000_000_000;
+}
+
+function getKingTokenMeta(mint) {
+  if (!mint) return {};
+
+  try {
+    return db.prepare(`
+      SELECT *
+      FROM token_stats
+      WHERE mint = ?
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).get(mint) || {};
+  } catch (_err) {
+    return {};
+  }
+}
+
+function getKingOfMoonzSnapshot() {
+  const now = Date.now();
+  const hourStart = new Date(now);
+  hourStart.setMinutes(0, 0, 0);
+
+  const hourStartMs = hourStart.getTime();
+  const hourEndMs = hourStartMs + 3600000;
+
+  let rows = [];
+
+  try {
+    rows = db.prepare(`
+      SELECT *
+      FROM trades
+      ORDER BY rowid DESC
+      LIMIT 20000
+    `).all();
+  } catch (err) {
+    console.error("[king] trades read failed:", err?.message || err);
+    return {
+      hour_start: hourStartMs,
+      hour_end: hourEndMs,
+      top10: [],
+      top3: [],
+      king: null,
+    };
+  }
+
+  const byMint = new Map();
+
+  for (const row of rows) {
+    const mint = String(row.mint || row.token_mint || row.tokenMint || "").trim();
+    if (!mint) continue;
+
+    const ts = kingParseTime(row);
+    if (!ts || ts < hourStartMs || ts >= hourEndMs) continue;
+
+    let volumeUsd = kingNum(row, [
+      "volume_usd",
+      "volumeUsd",
+      "amount_usd",
+      "amountUsd",
+      "value_usd",
+      "valueUsd",
+      "trade_usd",
+      "tradeUsd",
+      "usd_value",
+      "usdValue",
+    ]);
+
+    const quoteUi = kingQuoteAmountUi(row);
+
+    // Fallback if trade rows do not store USD volume.
+    if (volumeUsd <= 0) {
+      const quoteAsset = String(
+        row.quote_asset ||
+        row.quoteAsset ||
+        row.quote ||
+        "SOL"
+      ).toUpperCase();
+
+      if (quoteAsset === "USDC") {
+        volumeUsd = quoteUi;
+      } else {
+        const solUsd =
+          typeof getPrice === "function"
+            ? Number(getPrice("SOL_USD")?.price || 0)
+            : 0;
+
+        volumeUsd = solUsd > 0 ? quoteUi * solUsd : quoteUi;
+      }
+    }
+
+    const side = String(row.side || row.trade_side || row.type || "").toLowerCase();
+
+    const prev = byMint.get(mint) || {
+      mint,
+      hour_volume_usd: 0,
+      hour_volume_quote: 0,
+      trades_count: 0,
+      buys_count: 0,
+      sells_count: 0,
+      last_trade_at: 0,
+    };
+
+    prev.hour_volume_usd += Number(volumeUsd || 0);
+    prev.hour_volume_quote += Number(quoteUi || 0);
+    prev.trades_count += 1;
+
+    if (side.includes("buy")) prev.buys_count += 1;
+    if (side.includes("sell")) prev.sells_count += 1;
+
+    prev.last_trade_at = Math.max(prev.last_trade_at || 0, ts);
+    byMint.set(mint, prev);
+  }
+
+  const top10 = [...byMint.values()]
+    .sort((a, b) => {
+      if (b.hour_volume_usd !== a.hour_volume_usd) {
+        return b.hour_volume_usd - a.hour_volume_usd;
+      }
+
+      if (b.trades_count !== a.trades_count) {
+        return b.trades_count - a.trades_count;
+      }
+
+      return b.last_trade_at - a.last_trade_at;
+    })
+    .slice(0, 10)
+    .map((item, index) => {
+      const meta = getKingTokenMeta(item.mint);
+
+      return {
+        rank: index + 1,
+        mint: item.mint,
+        name: meta.name || meta.launch_name || meta.token_name || "Unknown Token",
+        symbol: meta.symbol || meta.launch_symbol || meta.token_symbol || "",
+        image: meta.image || meta.launch_image || meta.token_image || "",
+        price_usd: Number(meta.price_usd || meta.priceUsd || 0),
+        marketcap_usd: Number(meta.marketcap_usd || meta.marketCapUsd || 0),
+        hour_volume_usd: Number(item.hour_volume_usd || 0),
+        hour_volume_quote: Number(item.hour_volume_quote || 0),
+        trades_count: Number(item.trades_count || 0),
+        buys_count: Number(item.buys_count || 0),
+        sells_count: Number(item.sells_count || 0),
+        last_trade_at: item.last_trade_at || 0,
+      };
+    });
+
+  return {
+    hour_start: hourStartMs,
+    hour_end: hourEndMs,
+    top10,
+    top3: top10.slice(0, 3),
+    king: top10[0] || null,
+  };
+}
+
+app.get("/api/king-of-moonz", (_req, res) => {
+  try {
+    res.json({
+      ok: true,
+      ...getKingOfMoonzSnapshot(),
+    });
+  } catch (err) {
+    console.error("[king] api failed:", err?.message || err);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load King of the Moonz",
+    });
+  }
+});
+
 
 const server = http.createServer(app);
 

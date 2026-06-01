@@ -15,6 +15,44 @@ db.pragma("cache_size = -200000");
 db.pragma("temp_store = MEMORY");
 db.pragma("busy_timeout = 5000");
 
+
+
+// User profile/social tables.
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_profiles (
+  wallet TEXT PRIMARY KEY,
+  username TEXT,
+  username_lc TEXT,
+  display_name TEXT,
+  bio TEXT,
+  avatar_url TEXT,
+  avatar_updated_at INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS user_profiles_username_lc_unique
+ON user_profiles(username_lc)
+WHERE username_lc IS NOT NULL AND username_lc != '';
+
+CREATE INDEX IF NOT EXISTS user_profiles_updated_idx
+ON user_profiles(updated_at);
+
+CREATE TABLE IF NOT EXISTS user_follows (
+  follower_wallet TEXT NOT NULL,
+  following_wallet TEXT NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (follower_wallet, following_wallet),
+  CHECK (follower_wallet != following_wallet)
+);
+
+CREATE INDEX IF NOT EXISTS user_follows_follower_idx
+ON user_follows(follower_wallet, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS user_follows_following_idx
+ON user_follows(following_wallet, created_at DESC);
+`);
+
 function now() {
   return Math.floor(Date.now() / 1000);
 }
@@ -363,7 +401,7 @@ function insertEvent(row) {
 }
 
 function insertTrade(row) {
-  db.prepare(`
+  const result = db.prepare(`
     INSERT OR IGNORE INTO trades (
       sig, slot, block_time, log_index,
       mint, user, side, phase, phase_u8, quote_asset, quote_asset_u8,
@@ -403,6 +441,8 @@ function insertTrade(row) {
     row.raw_event_json ?? null,
     row.created_at ?? now()
   );
+
+  return result.changes > 0;
 }
 
 function getHolderCount(mint) {
@@ -684,6 +724,7 @@ function get24hPriceChange(mint) {
       ? Number(token.price_sol)
       : Number(latest?.close_sol || 0);
 
+  // Preferred baseline: a real candle from 24h ago or older.
   let old = db.prepare(`
     SELECT close_usd, close_sol, bucket_ts
     FROM candles_1m
@@ -697,24 +738,51 @@ function get24hPriceChange(mint) {
     LIMIT 1
   `).get(mint, since);
 
-  // If token is newer than 24h, do not show a fake 24h move from the
-  // first bootstrap candle. Keep change neutral until a real 24h baseline exists.
+  // New-token fallback: compare against the first candle open.
+  // This makes the token card show movement since launch until a real 24h
+  // baseline exists.
   if (!old) {
-    return {
-      price_change_24h_percent: 0,
-      price_change_24h_usd: 0,
-      price_24h_ago_usd: currentUsd > 0 ? currentUsd : null,
-      price_24h_ago_sol: currentSol > 0 ? currentSol : null,
-    };
+    old = db.prepare(`
+      SELECT
+        COALESCE(open_usd, close_usd) AS close_usd,
+        COALESCE(open_sol, close_sol) AS close_sol,
+        bucket_ts
+      FROM candles_1m
+      WHERE mint = ?
+        AND (
+          open_usd IS NOT NULL
+          OR close_usd IS NOT NULL
+          OR open_sol IS NOT NULL
+          OR close_sol IS NOT NULL
+        )
+      ORDER BY bucket_ts ASC
+      LIMIT 1
+    `).get(mint);
   }
 
-  const oldUsd = Number(old?.close_usd || 0);
-  const oldSol = Number(old?.close_sol || 0);
+  let oldUsd = Number(old?.close_usd || 0);
+  let oldSol = Number(old?.close_sol || 0);
 
-  const current = currentUsd > 0 ? currentUsd : currentSol;
-  const oldPrice = oldUsd > 0 ? oldUsd : oldSol;
+  // Final fallback: if candles are missing/stale but token_stats already has
+  // a stored baseline, use it instead of returning fake 0.00%.
+  if ((!oldUsd || oldUsd <= 0) && Number(token?.price_24h_ago_usd || 0) > 0) {
+    oldUsd = Number(token.price_24h_ago_usd);
+  }
 
-  if (!Number.isFinite(current) || !Number.isFinite(oldPrice) || current <= 0 || oldPrice <= 0) {
+  if ((!oldSol || oldSol <= 0) && Number(token?.price_24h_ago_sol || 0) > 0) {
+    oldSol = Number(token.price_24h_ago_sol);
+  }
+
+  const useUsd = currentUsd > 0 && oldUsd > 0;
+  const current = useUsd ? currentUsd : currentSol;
+  const oldPrice = useUsd ? oldUsd : oldSol;
+
+  if (
+    !Number.isFinite(current) ||
+    !Number.isFinite(oldPrice) ||
+    current <= 0 ||
+    oldPrice <= 0
+  ) {
     return {
       price_change_24h_percent: 0,
       price_change_24h_usd: 0,
@@ -736,6 +804,7 @@ function get24hPriceChange(mint) {
     price_24h_ago_sol: oldSol || null,
   };
 }
+
 
 function refresh24hVolume(mint) {
   const since = now() - 86400;
@@ -793,7 +862,7 @@ function getToken(mint) {
       l.pinata_cid AS launch_pinata_cid,
 
       l.launch_ts AS launch_ts,
-      COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
+      COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
 
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
@@ -820,12 +889,12 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
         l.pinata_cid AS launch_pinata_cid,
 
         l.launch_ts AS launch_ts,
-        COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
+        COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
 
       FROM token_stats ts
       LEFT JOIN launches l ON l.mint = ts.mint
       WHERE ts.phase = ?
-      ORDER BY COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) DESC
+      ORDER BY COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) DESC
       LIMIT ? OFFSET ?
     `).all(phase, cappedLimit, safeOffset);
   }
@@ -844,11 +913,11 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
       l.pinata_cid AS launch_pinata_cid,
 
       l.launch_ts AS launch_ts,
-      COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
+      COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
 
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
-    ORDER BY COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) DESC
+    ORDER BY COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) DESC
     LIMIT ? OFFSET ?
   `).all(cappedLimit, safeOffset);
 }
@@ -1014,7 +1083,7 @@ function getCreatorTokens(address) {
       l.pinata_cid AS launch_pinata_cid,
 
       l.launch_ts AS launch_ts,
-      COALESCE(NULLIF(l.launch_ts, 0), ts.last_trade_ts, ts.updated_at) AS created_at
+      COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
 
     FROM launches l
     LEFT JOIN token_stats ts ON ts.mint = l.mint
@@ -1035,6 +1104,280 @@ function getCreatorTrades(address) {
     WHERE l.creator = ?
     ORDER BY t.created_at DESC
   `).all(address);
+}
+
+
+
+function normalizeUsername(username) {
+  const clean = String(username || "")
+    .trim()
+    .replace(/^@+/, "")
+    .toLowerCase();
+
+  if (!clean) return "";
+
+  if (!/^[a-z0-9_]{3,20}$/.test(clean)) {
+    throw new Error("Username must be 3-20 characters using letters, numbers, or underscore only");
+  }
+
+  return clean;
+}
+
+function publicUserProfile(row) {
+  if (!row) return null;
+
+  const wallet = String(row.wallet || "");
+
+  const followerCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_follows
+    WHERE following_wallet = ?
+  `).get(wallet)?.count || 0;
+
+  const followingCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_follows
+    WHERE follower_wallet = ?
+  `).get(wallet)?.count || 0;
+
+  return {
+    wallet,
+    username: row.username || null,
+    display_username: row.username ? `@${row.username}` : null,
+    username_lc: row.username_lc || null,
+    display_name: row.display_name || null,
+    bio: row.bio || null,
+    avatar_url: row.avatar_url || null,
+    avatar_updated_at: row.avatar_updated_at || null,
+    follower_count: Number(followerCount || 0),
+    following_count: Number(followingCount || 0),
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function getUserProfile(wallet) {
+  if (!wallet) return null;
+
+  const row = db.prepare(`
+    SELECT *
+    FROM user_profiles
+    WHERE wallet = ?
+  `).get(String(wallet));
+
+  return publicUserProfile(row);
+}
+
+function getUserProfileByUsername(username) {
+  const usernameLc = normalizeUsername(username);
+
+  const row = db.prepare(`
+    SELECT *
+    FROM user_profiles
+    WHERE username_lc = ?
+  `).get(usernameLc);
+
+  return publicUserProfile(row);
+}
+
+function isUsernameAvailable(username, wallet = "") {
+  const usernameLc = normalizeUsername(username);
+
+  const row = db.prepare(`
+    SELECT wallet
+    FROM user_profiles
+    WHERE username_lc = ?
+  `).get(usernameLc);
+
+  return {
+    username: usernameLc,
+    available: !row || String(row.wallet) === String(wallet || ""),
+    owner_wallet: row?.wallet || null,
+  };
+}
+
+function upsertUserProfile({ wallet, username, display_name, bio, avatar_url }) {
+  if (!wallet) throw new Error("Wallet is required");
+
+  const cleanWallet = String(wallet).trim();
+  if (!cleanWallet) throw new Error("Wallet is required");
+
+  let usernameLc = null;
+  let usernameClean = null;
+
+  if (username !== undefined && username !== null && String(username).trim() !== "") {
+    usernameLc = normalizeUsername(username);
+    usernameClean = usernameLc;
+  }
+
+  const current = db.prepare(`
+    SELECT *
+    FROM user_profiles
+    WHERE wallet = ?
+  `).get(cleanWallet);
+
+  const nowTs = now();
+
+  const next = {
+    wallet: cleanWallet,
+    username: usernameClean !== null ? usernameClean : current?.username || null,
+    username_lc: usernameLc !== null ? usernameLc : current?.username_lc || null,
+    display_name:
+      display_name !== undefined
+        ? String(display_name || "").trim().slice(0, 40) || null
+        : current?.display_name || null,
+    bio:
+      bio !== undefined
+        ? String(bio || "").trim().slice(0, 160) || null
+        : current?.bio || null,
+    avatar_url:
+      avatar_url !== undefined
+        ? avatar_url || null
+        : current?.avatar_url || null,
+    avatar_updated_at:
+      avatar_url !== undefined
+        ? nowTs
+        : current?.avatar_updated_at || null,
+    updated_at: nowTs,
+  };
+
+  db.prepare(`
+    INSERT INTO user_profiles (
+      wallet,
+      username,
+      username_lc,
+      display_name,
+      bio,
+      avatar_url,
+      avatar_updated_at,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(wallet) DO UPDATE SET
+      username = excluded.username,
+      username_lc = excluded.username_lc,
+      display_name = excluded.display_name,
+      bio = excluded.bio,
+      avatar_url = excluded.avatar_url,
+      avatar_updated_at = excluded.avatar_updated_at,
+      updated_at = excluded.updated_at
+  `).run(
+    next.wallet,
+    next.username,
+    next.username_lc,
+    next.display_name,
+    next.bio,
+    next.avatar_url,
+    next.avatar_updated_at,
+    current?.created_at || nowTs,
+    next.updated_at
+  );
+
+  return getUserProfile(cleanWallet);
+}
+
+function followUser(followerWallet, followingWallet) {
+  const follower = String(followerWallet || "").trim();
+  const following = String(followingWallet || "").trim();
+
+  if (!follower || !following) throw new Error("Follower and following wallets are required");
+  if (follower === following) throw new Error("You cannot follow yourself");
+
+  const nowTs = now();
+
+  db.prepare(`
+    INSERT OR IGNORE INTO user_follows (
+      follower_wallet,
+      following_wallet,
+      created_at
+    )
+    VALUES (?, ?, ?)
+  `).run(follower, following, nowTs);
+
+  return {
+    ok: true,
+    follower_wallet: follower,
+    following_wallet: following,
+    following: true,
+  };
+}
+
+function unfollowUser(followerWallet, followingWallet) {
+  const follower = String(followerWallet || "").trim();
+  const following = String(followingWallet || "").trim();
+
+  if (!follower || !following) throw new Error("Follower and following wallets are required");
+
+  db.prepare(`
+    DELETE FROM user_follows
+    WHERE follower_wallet = ?
+      AND following_wallet = ?
+  `).run(follower, following);
+
+  return {
+    ok: true,
+    follower_wallet: follower,
+    following_wallet: following,
+    following: false,
+  };
+}
+
+function isFollowing(followerWallet, followingWallet) {
+  const row = db.prepare(`
+    SELECT 1 AS ok
+    FROM user_follows
+    WHERE follower_wallet = ?
+      AND following_wallet = ?
+  `).get(String(followerWallet || ""), String(followingWallet || ""));
+
+  return Boolean(row);
+}
+
+function listFollowers(wallet, limit = 50) {
+  const rows = db.prepare(`
+    SELECT
+      f.follower_wallet AS wallet,
+      f.created_at AS followed_at,
+      p.username,
+      p.username_lc,
+      p.display_name,
+      p.bio,
+      p.avatar_url,
+      p.avatar_updated_at,
+      p.created_at,
+      p.updated_at
+    FROM user_follows f
+    LEFT JOIN user_profiles p ON p.wallet = f.follower_wallet
+    WHERE f.following_wallet = ?
+    ORDER BY f.created_at DESC
+    LIMIT ?
+  `).all(String(wallet || ""), Math.min(Math.max(Number(limit) || 50, 1), 100));
+
+  return rows.map(publicUserProfile).filter(Boolean);
+}
+
+function listFollowing(wallet, limit = 50) {
+  const rows = db.prepare(`
+    SELECT
+      f.following_wallet AS wallet,
+      f.created_at AS followed_at,
+      p.username,
+      p.username_lc,
+      p.display_name,
+      p.bio,
+      p.avatar_url,
+      p.avatar_updated_at,
+      p.created_at,
+      p.updated_at
+    FROM user_follows f
+    LEFT JOIN user_profiles p ON p.wallet = f.following_wallet
+    WHERE f.follower_wallet = ?
+    ORDER BY f.created_at DESC
+    LIMIT ?
+  `).all(String(wallet || ""), Math.min(Math.max(Number(limit) || 50, 1), 100));
+
+  return rows.map(publicUserProfile).filter(Boolean);
 }
 
 function getCreatorProfile(address) {
@@ -1183,4 +1526,14 @@ module.exports = {
   getTrades,
   getCandles,
   getCreatorProfile,
+  normalizeUsername,
+  getUserProfile,
+  getUserProfileByUsername,
+  isUsernameAvailable,
+  upsertUserProfile,
+  followUser,
+  unfollowUser,
+  isFollowing,
+  listFollowers,
+  listFollowing,
 };
