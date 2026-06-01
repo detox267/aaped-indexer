@@ -37,6 +37,7 @@ const {
   markNotificationsRead,
   markAllNotificationsRead,
   createUserNotification,
+  createNotificationsForFollowers,
 } = require("./db");
 
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
@@ -751,6 +752,100 @@ app.get("/profile/:wallet/is-following/:target", (req, res) => {
   }
 });
 
+
+
+
+function expectedShareTokenMessage({ wallet, mint, timestamp }) {
+  return `Moonz share token ${mint} from ${wallet} at ${timestamp}`;
+}
+
+function requireSignedTokenShareBody(req, mint) {
+  const wallet = cleanWalletValue(req.body.wallet || req.body.creator || req.body.actor_wallet);
+  const timestamp = requireFreshTimestamp(req.body.timestamp);
+  const message = String(req.body.message || "");
+  const signature = String(req.body.signature || "");
+  const cleanMint = String(mint || "").trim();
+
+  if (!wallet) {
+    throw new Error("Wallet is required");
+  }
+
+  if (!cleanMint) {
+    throw new Error("Token mint is required");
+  }
+
+  const expected = expectedShareTokenMessage({
+    wallet,
+    mint: cleanMint,
+    timestamp,
+  });
+
+  if (message !== expected) {
+    throw new Error("Signed message mismatch");
+  }
+
+  verifyWalletMessage({
+    wallet,
+    message,
+    signature,
+  });
+
+  return {
+    wallet,
+    mint: cleanMint,
+    timestamp,
+  };
+}
+
+
+app.post("/tokens/:mint/share-followers", async (req, res) => {
+  try {
+    checkFollowRateLimit(req);
+
+    const { wallet, mint } = requireSignedTokenShareBody(req, req.params.mint);
+
+    const token = getToken(mint) || {};
+
+    const symbol = String(token.symbol || token.token_symbol || "").trim();
+    const name = String(token.name || token.token_name || "").trim();
+    const image = token.image || token.imageUrl || token.image_url || null;
+
+    const result = createNotificationsForFollowers({
+      actor_wallet: wallet,
+      type: "token_shared_by_creator",
+      title: symbol
+        ? `@${wallet.slice(0, 4)} shared $${symbol}`
+        : "A creator shared a Moonz token",
+      body: name
+        ? `${name} was shared by a creator you follow.`
+        : "A creator you follow shared a token.",
+      mint,
+      data: {
+        creator: wallet,
+        mint,
+        name: name || null,
+        symbol: symbol || null,
+        image,
+        token_url: `/token/${mint}`,
+        creator_url: `/creator/${wallet}`,
+      },
+      unique_key_prefix: `token_shared_by_creator:${wallet}:${mint}`,
+    });
+
+    return res.json({
+      ok: true,
+      followers: Number(result.followers || 0),
+      inserted: Number(result.inserted || 0),
+    });
+  } catch (err) {
+    const status = err.status || 400;
+
+    return res.status(status).json({
+      ok: false,
+      error: err.message || "Failed to share token",
+    });
+  }
+});
 
 
 app.get("/notifications/:wallet", (req, res) => {
