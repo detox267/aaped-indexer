@@ -1707,15 +1707,13 @@ function markNotificationsRead(wallet, ids = []) {
 
   if (!clean || !safeIds.length) return 0;
 
-  const nowTs = now();
   const placeholders = safeIds.map(() => "?").join(",");
 
   const result = db.prepare(`
-    UPDATE user_notifications
-    SET read_at = COALESCE(read_at, ?)
+    DELETE FROM user_notifications
     WHERE recipient_wallet = ?
       AND id IN (${placeholders})
-  `).run(nowTs, clean, ...safeIds);
+  `).run(clean, ...safeIds);
 
   return result.changes || 0;
 }
@@ -1726,11 +1724,9 @@ function markAllNotificationsRead(wallet) {
   if (!clean) return 0;
 
   const result = db.prepare(`
-    UPDATE user_notifications
-    SET read_at = COALESCE(read_at, ?)
+    DELETE FROM user_notifications
     WHERE recipient_wallet = ?
-      AND read_at IS NULL
-  `).run(now(), clean);
+  `).run(clean);
 
   return result.changes || 0;
 }
