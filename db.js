@@ -140,6 +140,22 @@ CREATE INDEX IF NOT EXISTS user_notifications_mint_idx
 ON user_notifications(mint);
 `);
 
+
+
+// One-time launch notification marker.
+db.exec(`
+CREATE TABLE IF NOT EXISTS creator_launch_notifications_sent (
+  mint TEXT PRIMARY KEY,
+  creator TEXT NOT NULL,
+  followers_count INTEGER DEFAULT 0,
+  inserted_count INTEGER DEFAULT 0,
+  sent_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS creator_launch_notifications_creator_idx
+ON creator_launch_notifications_sent(creator, sent_at DESC);
+`);
+
 function now() {
   return Math.floor(Date.now() / 1000);
 }
@@ -1759,6 +1775,75 @@ function notifyFollowersOfCreatorLaunch({
   });
 }
 
+
+
+function notifyFollowersOnceOfCreatorLaunch({
+  creator,
+  mint,
+  name,
+  symbol,
+  image = null,
+}) {
+  const actor = String(creator || "").trim();
+  const tokenMint = String(mint || "").trim();
+
+  if (!actor || !tokenMint) {
+    return {
+      skipped: true,
+      reason: "missing_creator_or_mint",
+      followers: 0,
+      inserted: 0,
+    };
+  }
+
+  const existing = db.prepare(`
+    SELECT mint
+    FROM creator_launch_notifications_sent
+    WHERE mint = ?
+  `).get(tokenMint);
+
+  if (existing) {
+    return {
+      skipped: true,
+      reason: "already_sent",
+      followers: 0,
+      inserted: 0,
+    };
+  }
+
+  const result = notifyFollowersOfCreatorLaunch({
+    creator: actor,
+    mint: tokenMint,
+    name,
+    symbol,
+    image,
+  });
+
+  db.prepare(`
+    INSERT OR IGNORE INTO creator_launch_notifications_sent (
+      mint,
+      creator,
+      followers_count,
+      inserted_count,
+      sent_at
+    )
+    VALUES (?, ?, ?, ?, ?)
+  `).run(
+    tokenMint,
+    actor,
+    Number(result.followers || 0),
+    Number(result.inserted || 0),
+    now()
+  );
+
+  return {
+    skipped: false,
+    reason: "sent",
+    followers: Number(result.followers || 0),
+    inserted: Number(result.inserted || 0),
+  };
+}
+
 function getCreatorProfile(address) {
   const tokensCreated = getCreatorTokens(address);
   const trades = getCreatorTrades(address);
@@ -1922,4 +2007,5 @@ module.exports = {
   markNotificationsRead,
   markAllNotificationsRead,
   notifyFollowersOfCreatorLaunch,
+  notifyFollowersOnceOfCreatorLaunch,
 };

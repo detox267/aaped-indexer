@@ -42,6 +42,7 @@ const PROGRAM_PK = new PublicKey(PROGRAM_ID);
 const connection = new Connection(RPC_URL, { commitment: "confirmed" });
 const idl = loadIdl();
 const decodeEventsFromLogs = makeEventDecoder(idl);
+const accountCoder = new anchor.BorshCoder(idl);
 
 const TOKEN_DECIMALS = Number(process.env.TOKEN_DECIMALS || 6);
 const TOKEN_SCALE = 10 ** TOKEN_DECIMALS;
@@ -95,10 +96,8 @@ const TX_FETCH_DELAY_MS = Number(process.env.TX_FETCH_DELAY_MS || 750);
 const PHASE_BY_U8 = {
   0: "pending_dev_buy",
   1: "bonding",
-  2: "migration_pending",
-  3: "amm_live",
-  4: "migrated",
-  5: "switching",
+  2: "amm_live",
+  3: "switching",
 };
 
 const QUOTE_BY_U8 = {
@@ -163,6 +162,28 @@ function liveDedupeKey(event) {
 
   if (event.type === "token.stats.updated") {
     return `stats:${event.mint}`;
+  }
+
+  if (event.type === "token.live.updated") {
+    return {
+      type: event.type,
+      mint: event.mint,
+      stats: compactStats(event.stats),
+      trade: compactLiveTrade(event.trade),
+      candle: compactCandle(
+        event.candle,
+        event.candle?.interval || event.interval || "1m"
+      ),
+      candle_15m: compactCandle(event.candle_15m, "15m"),
+      holders: event.holders
+        ? {
+            mint: event.holders.mint || event.mint,
+            holders: event.holders.holders,
+            holders_count: event.holders.holders_count,
+            updated_at: event.holders.updated_at,
+          }
+        : null,
+    };
   }
 
   if (event.type === "holders.updated") {
@@ -426,6 +447,12 @@ function compactStats(stats = {}) {
 
     tokens_sold: stats.tokens_sold,
     tokens_remaining: stats.tokens_remaining,
+    sol_collected: stats.sol_collected,
+    sol_collected_lamports: stats.sol_collected_lamports || stats.sol_collected,
+
+    liquidity_sol: stats.liquidity_sol,
+    liquidity_usd: stats.liquidity_usd,
+
     total_supply: stats.total_supply,
     sale_supply: stats.sale_supply,
     lp_supply: stats.lp_supply,
@@ -704,18 +731,126 @@ function readU128(buf, offset, fallback = 0n) {
 function decodeLaunchState(buf) {
   if (!buf || buf.length < 64) return null;
 
+  function numberField(value, fallback = 0) {
+    const n = Number(value?.toString ? value.toString() : value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function boolField(value) {
+    return Boolean(value);
+  }
+
+  function saneState(decoded) {
+    if (!decoded) return false;
+
+    const stateU8 = numberField(decoded.state ?? decoded.stateU8, 999);
+    const quoteAssetU8 = numberField(decoded.quoteAsset ?? decoded.quote_asset ?? decoded.quoteAssetU8, 999);
+    const saleSupply = toBigIntMaybe(decoded.saleSupply ?? decoded.sale_supply, 0n);
+
+    if (stateU8 < 0 || stateU8 > 3) return false;
+    if (quoteAssetU8 < 0 || quoteAssetU8 > 1) return false;
+    if (saleSupply <= 0n || saleSupply > TOTAL_SUPPLY_BASE) return false;
+
+    return true;
+  }
+
+  // Primary path: decode using the current Anchor IDL instead of brittle manual offsets.
+  for (const accountName of ["launchState", "LaunchState"]) {
+    try {
+      const decoded = accountCoder.accounts.decode(accountName, buf);
+
+      if (!saneState(decoded)) {
+        continue;
+      }
+
+      const stateU8 = numberField(decoded.state ?? decoded.stateU8, 0);
+      const quoteAssetU8 = numberField(decoded.quoteAsset ?? decoded.quote_asset ?? decoded.quoteAssetU8, 0);
+      const pendingQuoteAssetU8 = numberField(
+        decoded.pendingQuoteAsset ?? decoded.pending_quote_asset ?? decoded.pendingQuoteAssetU8,
+        quoteAssetU8
+      );
+
+      return {
+        bump: numberField(decoded.bump, 0),
+        escrowSolBump: numberField(decoded.escrowSolBump ?? decoded.escrow_sol_bump, 0),
+
+        treasuryWsolBump: 0,
+        treasuryUsdcBump: 0,
+
+        stateU8,
+        phase: PHASE_BY_U8[stateU8] || "unknown",
+
+        mint: toBase58Maybe(decoded.mint),
+        creator: toBase58Maybe(decoded.creator),
+
+        platform: null,
+        coreAuthority: null,
+
+        saleVault: toBase58Maybe(decoded.saleVault ?? decoded.sale_vault),
+        lpVault: toBase58Maybe(decoded.lpVault ?? decoded.lp_vault),
+        treasuryWsolVault: toBase58Maybe(decoded.treasuryWsolVault ?? decoded.treasury_wsol_vault),
+        treasuryUsdcVault: toBase58Maybe(decoded.treasuryUsdcVault ?? decoded.treasury_usdc_vault),
+        escrowSolVault: toBase58Maybe(decoded.escrowSolVault ?? decoded.escrow_sol_vault),
+
+        totalSupply: TOTAL_SUPPLY_BASE,
+        saleSupply: toBigIntMaybe(decoded.saleSupply ?? decoded.sale_supply, SALE_SUPPLY_BASE),
+        lpSupply: LP_SUPPLY_BASE,
+
+        ammInitialSol: 0n,
+        ammInitialTok: 0n,
+        migratedAt: 0n,
+
+        ammType: 0,
+        lpShareClaimBase: 0n,
+
+        quoteAssetU8,
+        quoteAsset: QUOTE_BY_U8[quoteAssetU8] || "SOL",
+
+        pendingQuoteAssetU8,
+        pendingQuoteAsset: QUOTE_BY_U8[pendingQuoteAssetU8] || "SOL",
+
+        lastPoolSwitchTs: toBigIntMaybe(decoded.lastPoolSwitchTs ?? decoded.last_pool_switch_ts, 0n),
+        switchStartedAt: toBigIntMaybe(decoded.switchStartedAt ?? decoded.switch_started_at, 0n),
+        switchFeeEscrowedLamports: toBigIntMaybe(
+          decoded.switchFeeEscrowedLamports ?? decoded.switch_fee_escrowed_lamports,
+          0n
+        ),
+        switchSwapExecuted: boolField(decoded.switchSwapExecuted ?? decoded.switch_swap_executed),
+
+        feeTotalBps: TRADE_FEE_BPS,
+        feeCreatorBps: 0,
+        feePlatformBps: 0,
+
+        tokensSold: toBigIntMaybe(decoded.tokensSold ?? decoded.tokens_sold, 0n),
+        solCollected: toBigIntMaybe(decoded.solCollected ?? decoded.sol_collected, 0n),
+
+        launchTs: 0n,
+        lastTradeTs: toBigIntMaybe(decoded.lastTradeTs ?? decoded.last_trade_ts, 0n),
+
+        metadata: toBase58Maybe(decoded.metadata),
+
+        devBuyDone: boolField(decoded.devBuyDone ?? decoded.dev_buy_done),
+        escrowSettled: boolField(decoded.escrowSettled ?? decoded.escrow_settled),
+        metadataInitialized: boolField(decoded.metadataInitialized ?? decoded.metadata_initialized),
+        mintFinalized: boolField(decoded.mintFinalized ?? decoded.mint_finalized),
+      };
+    } catch (_) {}
+  }
+
+  // Fallback manual decode for the current compact layout.
   let o = 8;
 
   const bump = readU8(buf, o); o += 1;
-  const treasuryWsolBump = readU8(buf, o); o += 1;
-  const treasuryUsdcBump = readU8(buf, o); o += 1;
   const escrowSolBump = readU8(buf, o); o += 1;
+
   const stateU8 = readU8(buf, o); o += 1;
+  const devBuyDone = Boolean(readU8(buf, o)); o += 1;
+  const escrowSettled = Boolean(readU8(buf, o)); o += 1;
+  const metadataInitialized = Boolean(readU8(buf, o)); o += 1;
+  const mintFinalized = Boolean(readU8(buf, o)); o += 1;
 
   const mint = readPubkey(buf, o); o += 32;
   const creator = readPubkey(buf, o); o += 32;
-  const platform = readPubkey(buf, o); o += 32;
-  const coreAuthority = readPubkey(buf, o); o += 32;
 
   const saleVault = readPubkey(buf, o); o += 32;
   const lpVault = readPubkey(buf, o); o += 32;
@@ -723,63 +858,39 @@ function decodeLaunchState(buf) {
   const treasuryUsdcVault = readPubkey(buf, o); o += 32;
   const escrowSolVault = readPubkey(buf, o); o += 32;
 
-  const totalSupply = readU64(buf, o); o += 8;
   const saleSupply = readU64(buf, o); o += 8;
-  const lpSupply = readU64(buf, o); o += 8;
-
-  const ammInitialSol = readU64(buf, o); o += 8;
-  const ammInitialTok = readU64(buf, o); o += 8;
-  const migratedAt = readI64(buf, o); o += 8;
-
-  const ammType = readU8(buf, o); o += 1;
-  const lpShareClaimBase = readU64(buf, o); o += 8;
-
-  const quoteAssetU8 = readU8(buf, o); o += 1;
-  const pendingQuoteAssetU8 = readU8(buf, o); o += 1;
-  const lastPoolSwitchTs = readI64(buf, o); o += 8;
-  const switchStartedAt = readI64(buf, o); o += 8;
-
-  const feeTotalBps = readU16(buf, o); o += 2;
-  const feeCreatorBps = readU16(buf, o); o += 2;
-  const feePlatformBps = readU16(buf, o); o += 2;
-
   const tokensSold = readU64(buf, o); o += 8;
   const solCollected = readU128(buf, o); o += 16;
 
-  const launchTs = readI64(buf, o); o += 8;
+  const quoteAssetU8 = readU8(buf, o); o += 1;
+  const pendingQuoteAssetU8 = readU8(buf, o); o += 1;
+
+  const lastPoolSwitchTs = readI64(buf, o); o += 8;
+  const switchStartedAt = readI64(buf, o); o += 8;
+  const switchFeeEscrowedLamports = readU64(buf, o); o += 8;
+  const switchSwapExecuted = Boolean(readU8(buf, o)); o += 1;
+
   const lastTradeTs = readI64(buf, o); o += 8;
+  const metadata = readPubkey(buf, o); o += 32;
 
-  let metadata = null;
-  if (hasBytes(buf, o, 32)) {
-    metadata = readPubkey(buf, o);
-    o += 32;
-  }
-
-  let devBuyDone = false;
-  if (hasBytes(buf, o, 1)) {
-    devBuyDone = Boolean(readU8(buf, o));
-    o += 1;
-  }
-
-  let escrowSettled = false;
-  if (hasBytes(buf, o, 1)) {
-    escrowSettled = Boolean(readU8(buf, o));
-    o += 1;
+  if (stateU8 > 3 || quoteAssetU8 > 1 || saleSupply <= 0n || saleSupply > TOTAL_SUPPLY_BASE) {
+    return null;
   }
 
   return {
     bump,
-    treasuryWsolBump,
-    treasuryUsdcBump,
     escrowSolBump,
+    treasuryWsolBump: 0,
+    treasuryUsdcBump: 0,
 
     stateU8,
     phase: PHASE_BY_U8[stateU8] || "unknown",
 
     mint,
     creator,
-    platform,
-    coreAuthority,
+
+    platform: null,
+    coreAuthority: null,
 
     saleVault,
     lpVault,
@@ -787,42 +898,46 @@ function decodeLaunchState(buf) {
     treasuryUsdcVault,
     escrowSolVault,
 
-    totalSupply,
-    saleSupply,
-    lpSupply,
+    totalSupply: TOTAL_SUPPLY_BASE,
+    saleSupply: saleSupply || SALE_SUPPLY_BASE,
+    lpSupply: LP_SUPPLY_BASE,
 
-    ammInitialSol,
-    ammInitialTok,
-    migratedAt,
+    ammInitialSol: 0n,
+    ammInitialTok: 0n,
+    migratedAt: 0n,
 
-    ammType,
-    lpShareClaimBase,
+    ammType: 0,
+    lpShareClaimBase: 0n,
 
     quoteAssetU8,
-    quoteAsset: QUOTE_BY_U8[quoteAssetU8] || "UNKNOWN",
+    quoteAsset: QUOTE_BY_U8[quoteAssetU8] || "SOL",
 
     pendingQuoteAssetU8,
-    pendingQuoteAsset: QUOTE_BY_U8[pendingQuoteAssetU8] || "UNKNOWN",
+    pendingQuoteAsset: QUOTE_BY_U8[pendingQuoteAssetU8] || "SOL",
 
     lastPoolSwitchTs,
     switchStartedAt,
+    switchFeeEscrowedLamports,
+    switchSwapExecuted,
 
-    feeTotalBps,
-    feeCreatorBps,
-    feePlatformBps,
+    feeTotalBps: TRADE_FEE_BPS,
+    feeCreatorBps: 0,
+    feePlatformBps: 0,
 
     tokensSold,
     solCollected,
 
-    launchTs,
+    launchTs: 0n,
     lastTradeTs,
 
     metadata,
 
     devBuyDone,
     escrowSettled,
+    metadataInitialized,
+    mintFinalized,
   };
-    }
+}
 
 function decodeTokenAccountAmount(buf) {
   if (!buf || buf.length < 72) return 0n;
@@ -845,6 +960,8 @@ function calculateStatsFromState(state, balances, solUsd) {
   const isAmmLive =
     phase === "amm_live" ||
     phase === "amm" ||
+    phase === "switching" ||
+    stateU8 === 2 ||
     stateU8 === 3;
 
   const totalSupplyUi = baseToUi(totalSupply || TOTAL_SUPPLY_BASE);
@@ -1008,8 +1125,8 @@ async function refreshMintState(mint, io = null) {
     treasury_usdc_vault: state.treasuryUsdcVault || pdas.treasuryUsdcVault,
     metadata: state.metadata,
     creator: state.creator,
-    platform: state.platform,
-    core_authority: state.coreAuthority,
+    platform: state.platform || undefined,
+    core_authority: state.coreAuthority || undefined,
     total_supply: bigIntToString(state.totalSupply),
     sale_supply: bigIntToString(state.saleSupply),
     lp_supply: bigIntToString(state.lpSupply),
@@ -1037,7 +1154,7 @@ async function refreshMintState(mint, io = null) {
     treasury_usdc_amount: bigIntToString(balances.treasuryUsdcAmount),
   });
 
-  const stats = upsertTokenStats(mint, {
+  let stats = upsertTokenStats(mint, {
     name: launchMeta?.name || undefined,
     symbol: launchMeta?.symbol || undefined,
     image: mediaUrl || undefined,
@@ -1052,6 +1169,16 @@ async function refreshMintState(mint, io = null) {
     marketcap_quote: computed.marketcapQuote,
     marketcap_sol: computed.marketcapSol,
     marketcap_usd: computed.marketcapUsd,
+
+    // Bonding curve quote reserve / collected SOL.
+    // UI uses this for "SOL Collected" and bonding liquidity.
+    sol_collected: bigIntToString(state.solCollected),
+    sol_collected_lamports: bigIntToString(state.solCollected),
+    liquidity_sol: Number(state.solCollected || 0n) / 1_000_000_000,
+    liquidity_usd:
+      (Number(state.solCollected || 0n) / 1_000_000_000) *
+      Number(solUsd || 0),
+
     total_supply: bigIntToString(computed.totalSupply),
     sale_supply: bigIntToString(computed.saleSupply),
     lp_supply: bigIntToString(computed.lpSupply),
@@ -1068,6 +1195,10 @@ async function refreshMintState(mint, io = null) {
     treasury_usdc_amount: bigIntToString(balances.treasuryUsdcAmount),
     last_trade_ts: Number(state.lastTradeTs || 0n) || null,
   });
+
+  // Recalculate 24h/since-launch price change after fresh reserve price update.
+  // Without this, price_usd can update while price_change_24h_percent remains stale.
+  stats = refresh24hVolume(mint) || stats;
 
   // Do not publish refreshMintState() stats to Redis.
   // refreshMintState() can run from page refreshes, health checks, recovery,
@@ -1289,17 +1420,47 @@ function priceFromAmounts({ quoteAmountBase, tokenAmountBase, quoteAsset }) {
 
 const ammTradeSeenBySig = new Map();
 
-function rememberAmmTradeForSig(sig, kind) {
+function tradeFingerprintFromEvent(event) {
+  const data = event?.data || {};
+  const quoteAmount = toBigIntMaybe(
+    data.quote_amount ??
+      data.quoteAmount ??
+      data.input_amount ??
+      data.inputAmount ??
+      0n,
+    0n
+  );
+
+  const tokenAmount = toBigIntMaybe(
+    data.token_amount ??
+      data.tokenAmount ??
+      data.output_amount ??
+      data.outputAmount ??
+      0n,
+    0n
+  );
+
+  return `${quoteAmount.toString()}:${tokenAmount.toString()}`;
+}
+
+function rememberAmmTradeForSig(sig, kind, event = null) {
   if (!sig || !kind) return;
 
-  let set = ammTradeSeenBySig.get(sig);
+  let byKind = ammTradeSeenBySig.get(sig);
 
-  if (!set) {
-    set = new Set();
-    ammTradeSeenBySig.set(sig, set);
+  if (!byKind) {
+    byKind = new Map();
+    ammTradeSeenBySig.set(sig, byKind);
   }
 
-  set.add(kind);
+  let fingerprints = byKind.get(kind);
+
+  if (!fingerprints) {
+    fingerprints = new Set();
+    byKind.set(kind, fingerprints);
+  }
+
+  fingerprints.add(tradeFingerprintFromEvent(event));
 
   // Prevent unbounded growth in long-running process.
   if (ammTradeSeenBySig.size > 5000) {
@@ -1308,8 +1469,13 @@ function rememberAmmTradeForSig(sig, kind) {
   }
 }
 
-function hasAmmTradeForSig(sig, kind) {
-  return !!sig && !!kind && ammTradeSeenBySig.get(sig)?.has(kind);
+function hasDuplicateAmmTradeForSig(sig, kind, event = null) {
+  if (!sig || !kind) return false;
+
+  const fingerprints = ammTradeSeenBySig.get(sig)?.get(kind);
+  if (!fingerprints) return false;
+
+  return fingerprints.has(tradeFingerprintFromEvent(event));
 }
 
 async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
@@ -1324,13 +1490,13 @@ async function handleTradeEvent({ sig, slot, tx, event, logIndex, io }) {
   // For trade indexing, keep the AMM-specific event and ignore the generic
   // event from the same transaction. Otherwise live trades shows duplicates.
   if (side === "AMM_BUY") {
-    rememberAmmTradeForSig(sig, "BUY");
+    rememberAmmTradeForSig(sig, "BUY", event);
   } else if (side === "AMM_SELL") {
-    rememberAmmTradeForSig(sig, "SELL");
-  } else if (side === "BUY" && hasAmmTradeForSig(sig, "BUY")) {
+    rememberAmmTradeForSig(sig, "SELL", event);
+  } else if (side === "BUY" && hasDuplicateAmmTradeForSig(sig, "BUY", event)) {
     console.log(`Skipping duplicate generic BuyEvent for AMM tx ${sig}`);
     return null;
-  } else if (side === "SELL" && hasAmmTradeForSig(sig, "SELL")) {
+  } else if (side === "SELL" && hasDuplicateAmmTradeForSig(sig, "SELL", event)) {
     console.log(`Skipping duplicate generic SellEvent for AMM tx ${sig}`);
     return null;
   }
@@ -1606,7 +1772,21 @@ const holdersCount = updateHolderBalancesFromDeltas({
     created_at: createdAt,
   };
 
-  insertTrade(tradeRow);
+  const tradeInserted = insertTrade(tradeRow);
+
+  // Forced reprocessing/backfills can see the same trade again.
+  // The trades table is idempotent via INSERT OR IGNORE, but candles/volume are
+  // additive. If this row already existed, stop here so candles and 24h volume
+  // are not double-counted.
+  if (!tradeInserted) {
+    return {
+      ...tradeRow,
+      priceSol: price.priceSol,
+      priceUsd: price.priceUsd,
+      createdAt,
+      duplicate: true,
+    };
+  }
 
   // For the initial dev buy, chart from the refreshed curve spot price instead of
   // the execution price. This prevents the first candle from drawing a scary
@@ -1664,6 +1844,7 @@ const holdersCount = updateHolderBalancesFromDeltas({
   });
 
   const stats = refresh24hVolume(mint);
+  const candle15m = candle ? latestCandle(mint, "15m") : null;
 
   const payload = {
     ...tradeRow,
@@ -1689,8 +1870,6 @@ const holdersCount = updateHolderBalancesFromDeltas({
       },
     });
 
-    const candle15m = latestCandle(mint, "15m");
-
     if (candle15m) {
       publishLiveEvent({
         type: "candle.updated",
@@ -1709,18 +1888,40 @@ const holdersCount = updateHolderBalancesFromDeltas({
     });
   }
 
-  if (holdersCount !== undefined) {
+  const holdersPayload =
+    holdersCount !== undefined
+      ? {
+          mint,
+          holders: holdersCount,
+          holders_count: holdersCount,
+          updated_at: createdAt,
+        }
+      : null;
+
+  if (holdersPayload) {
     publishLiveEvent({
       type: "holders.updated",
       mint,
-      holders: {
-        mint,
-        holders: holdersCount,
-        holders_count: holdersCount,
-        updated_at: createdAt,
-      },
+      holders: holdersPayload,
     });
   }
+
+  const liveUpdate = {
+    type: "token.live.updated",
+    mint,
+    stats: compactStats(stats || getToken(mint)),
+    trade: payload,
+    candle: candle
+      ? {
+          interval: "1m",
+          ...candle,
+        }
+      : null,
+    candle_15m: candle15m ? compactCandle(candle15m, "15m") : null,
+    holders: holdersPayload,
+  };
+
+  publishLiveEvent(liveUpdate);
 
   if (String(side || "").toUpperCase().includes("BUY")) {
     const compactLiveStats = compactStats(stats || getToken(mint));
@@ -1745,9 +1946,18 @@ const holdersCount = updateHolderBalancesFromDeltas({
         createdAt: payload.createdAt,
       },
     });
+
+    if (typeof publishKingOfMoonzSnapshot === "function") {
+      setTimeout(() => {
+        publishKingOfMoonzSnapshot("trade");
+      }, 0);
+    }
   }
 
   if (io) {
+    io.to(`mint:${mint}`).emit("token.live.updated", liveUpdate);
+    io.to(`mint:${mint}:live`).emit("token.live.updated", liveUpdate);
+
     io.to("global:trades").emit("trade", payload);
     io.to(`mint:${mint}`).emit("trade", payload);
     io.to(`mint:${mint}:trades`).emit("trade", payload);
@@ -2165,3 +2375,294 @@ module.exports = {
   derivePdas,
   decodeLaunchState,
 };
+
+
+// -----------------------------------------------------------------------------
+// King of the Moonz: hourly top traded tokens
+// -----------------------------------------------------------------------------
+
+function kingQuoteAmountUi(row = {}) {
+  const quoteAsset = String(
+    row.quote_asset ||
+    row.quoteAsset ||
+    row.quote ||
+    "SOL"
+  ).toUpperCase();
+
+  const ui = kingNum(row, [
+    "quote_amount_ui",
+    "quoteAmountUi",
+    "sol_amount_ui",
+    "solAmountUi",
+    "quote_in_ui",
+    "quoteInUi",
+    "quote_out_ui",
+    "quoteOutUi",
+  ]);
+
+  if (ui > 0) return Math.abs(ui);
+
+  const raw = Math.abs(kingNum(row, [
+    "quote_amount",
+    "quoteAmount",
+    "sol_amount",
+    "solAmount",
+    "quote_in",
+    "quoteIn",
+    "quote_out",
+    "quoteOut",
+  ]));
+
+  if (raw <= 0) return 0;
+
+  if (quoteAsset === "USDC") {
+    return raw / 1_000_000;
+  }
+
+  return raw / 1_000_000_000;
+}
+
+function kingParseTime(row = {}) {
+  const raw =
+    row.created_at ??
+    row.createdAt ??
+    row.timestamp ??
+    row.ts ??
+    row.time ??
+    row.block_time ??
+    row.blockTime ??
+    row.inserted_at ??
+    row.insertedAt;
+
+  if (raw === undefined || raw === null || raw === "") return 0;
+
+  if (typeof raw === "number") {
+    return raw > 10_000_000_000 ? raw : raw * 1000;
+  }
+
+  const s = String(raw).trim();
+
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return n > 10_000_000_000 ? n : n * 1000;
+  }
+
+  const parsed = new Date(s).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function kingNum(row = {}, keys = []) {
+  for (const key of keys) {
+    const v = row[key];
+    if (v === undefined || v === null || v === "") continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return 0;
+}
+
+function kingTokenMeta(mint) {
+  if (!mint) return {};
+
+  try {
+    return db.prepare(`
+      SELECT *
+      FROM token_stats
+      WHERE mint = ?
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).get(mint) || {};
+  } catch (_err) {
+    return {};
+  }
+}
+
+function getKingOfMoonzSnapshot() {
+  const now = Date.now();
+  const hourStart = new Date(now);
+  hourStart.setMinutes(0, 0, 0);
+
+  const hourStartMs = hourStart.getTime();
+  const hourEndMs = hourStartMs + 3600000;
+
+  let rows = [];
+
+  try {
+    rows = db.prepare(`
+      SELECT *
+      FROM trades
+      ORDER BY rowid DESC
+      LIMIT 20000
+    `).all();
+  } catch (err) {
+    console.error("[king] trades read failed:", err?.message || err);
+
+    return {
+      hour_start: hourStartMs,
+      hour_end: hourEndMs,
+      top10: [],
+      top3: [],
+      king: null,
+    };
+  }
+
+  const solUsd =
+    typeof getPrice === "function"
+      ? Number(getPrice("SOL_USD")?.price || 0)
+      : 0;
+
+  const byMint = new Map();
+
+  for (const row of rows) {
+    const mint = String(row.mint || row.token_mint || row.tokenMint || "").trim();
+    if (!mint) continue;
+
+    const ts = kingParseTime(row);
+    if (!ts || ts < hourStartMs || ts >= hourEndMs) continue;
+
+    let volumeUsd = kingNum(row, [
+      "volume_usd",
+      "volumeUsd",
+      "amount_usd",
+      "amountUsd",
+      "value_usd",
+      "valueUsd",
+      "trade_usd",
+      "tradeUsd",
+      "usd_value",
+      "usdValue",
+    ]);
+
+    const quoteUi = kingQuoteAmountUi(row);
+
+    if (volumeUsd <= 0) {
+      const quoteAsset = String(
+        row.quote_asset ||
+        row.quoteAsset ||
+        row.quote ||
+        "SOL"
+      ).toUpperCase();
+
+      if (quoteAsset === "USDC") {
+        volumeUsd = quoteUi;
+      } else if (solUsd > 0) {
+        volumeUsd = quoteUi * solUsd;
+      }
+    }
+
+    const side = String(row.side || row.trade_side || row.type || "").toLowerCase();
+
+    const prev = byMint.get(mint) || {
+      mint,
+      hour_volume_usd: 0,
+      hour_volume_quote: 0,
+      trades_count: 0,
+      buys_count: 0,
+      sells_count: 0,
+      last_trade_at: 0,
+    };
+
+    prev.hour_volume_usd += Number(volumeUsd || 0);
+    prev.hour_volume_quote += Number(quoteUi || 0);
+    prev.trades_count += 1;
+
+    if (side.includes("buy")) prev.buys_count += 1;
+    if (side.includes("sell")) prev.sells_count += 1;
+
+    prev.last_trade_at = Math.max(prev.last_trade_at || 0, ts);
+    byMint.set(mint, prev);
+  }
+
+  const top10 = [...byMint.values()]
+    .sort((a, b) => {
+      if (b.hour_volume_usd !== a.hour_volume_usd) {
+        return b.hour_volume_usd - a.hour_volume_usd;
+      }
+
+      if (b.trades_count !== a.trades_count) {
+        return b.trades_count - a.trades_count;
+      }
+
+      return b.last_trade_at - a.last_trade_at;
+    })
+    .slice(0, 10)
+    .map((item, index) => {
+      const meta = kingTokenMeta(item.mint);
+
+      return {
+        rank: index + 1,
+        mint: item.mint,
+        name:
+          meta.name ||
+          meta.launch_name ||
+          meta.token_name ||
+          "Unknown Token",
+        symbol:
+          meta.symbol ||
+          meta.launch_symbol ||
+          meta.token_symbol ||
+          "",
+        image:
+          meta.image ||
+          meta.launch_image ||
+          meta.token_image ||
+          "",
+        price_usd: Number(meta.price_usd || meta.priceUsd || 0),
+        marketcap_usd: Number(meta.marketcap_usd || meta.marketCapUsd || 0),
+        hour_volume_usd: Number(item.hour_volume_usd || 0),
+        hour_volume_quote: Number(item.hour_volume_quote || 0),
+        trades_count: Number(item.trades_count || 0),
+        buys_count: Number(item.buys_count || 0),
+        sells_count: Number(item.sells_count || 0),
+        last_trade_at: item.last_trade_at || 0,
+      };
+    });
+
+  return {
+    hour_start: hourStartMs,
+    hour_end: hourEndMs,
+    top10,
+    top3: top10.slice(0, 3),
+    king: top10[0] || null,
+  };
+}
+
+let __lastKingPayload = "";
+
+function publishKingOfMoonzSnapshot(reason = "tick") {
+  try {
+    if (typeof publishLiveEvent !== "function") return;
+
+    const snapshot = getKingOfMoonzSnapshot();
+
+    const compact = JSON.stringify({
+      king: snapshot.king?.mint || null,
+      top3: snapshot.top3.map((x) => `${x.mint}:${Math.round(x.hour_volume_usd)}`),
+      hour_start: snapshot.hour_start,
+    });
+
+    if (compact === __lastKingPayload && reason !== "force") return;
+    __lastKingPayload = compact;
+
+    publishLiveEvent({
+      type: "king.moonz.updated",
+      reason,
+      ...snapshot,
+    });
+  } catch (err) {
+    console.error("[king] publish failed:", err?.message || err);
+  }
+}
+
+if (!global.__kingOfMoonzIntervalMounted) {
+  global.__kingOfMoonzIntervalMounted = true;
+
+  setInterval(() => {
+    publishKingOfMoonzSnapshot("tick");
+  }, 10000);
+
+  setTimeout(() => {
+    publishKingOfMoonzSnapshot("startup");
+  }, 3000);
+}
+
