@@ -32,6 +32,11 @@ const {
   isFollowing,
   listFollowers,
   listFollowing,
+  listUserNotifications,
+  getUnreadNotificationCount,
+  markNotificationsRead,
+  markAllNotificationsRead,
+  createUserNotification,
 } = require("./db");
 
 const { startIndexer, refreshMintState, simulateBuy } = require("./indexer");
@@ -743,6 +748,118 @@ app.get("/profile/:wallet/is-following/:target", (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "Failed to check follow state" });
+  }
+});
+
+
+
+app.get("/notifications/:wallet", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.params.wallet);
+    const limit = req.query.limit || 50;
+
+    return res.json({
+      ok: true,
+      notifications: listUserNotifications(wallet, limit),
+      unread_count: getUnreadNotificationCount(wallet),
+    });
+  } catch (err) {
+    console.error("notifications list error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to load notifications",
+    });
+  }
+});
+
+app.get("/notifications/:wallet/unread-count", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.params.wallet);
+
+    return res.json({
+      ok: true,
+      unread_count: getUnreadNotificationCount(wallet),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Failed to load unread notification count",
+    });
+  }
+});
+
+app.post("/notifications/:wallet/read", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.params.wallet);
+    const ids = Array.isArray(req.body.ids) ? req.body.ids : [];
+
+    return res.json({
+      ok: true,
+      changed: markNotificationsRead(wallet, ids),
+      unread_count: getUnreadNotificationCount(wallet),
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to mark notifications read",
+    });
+  }
+});
+
+app.post("/notifications/:wallet/read-all", (req, res) => {
+  try {
+    const wallet = cleanWallet(req.params.wallet);
+
+    return res.json({
+      ok: true,
+      changed: markAllNotificationsRead(wallet),
+      unread_count: getUnreadNotificationCount(wallet),
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to mark notifications read",
+    });
+  }
+});
+
+// Dev/test helper. Remove or protect before mainnet if needed.
+app.post("/notifications/test", (req, res) => {
+  try {
+    const recipient = cleanWallet(req.body.recipient_wallet || req.body.recipient);
+    const actor = cleanWallet(req.body.actor_wallet || req.body.actor);
+    const mint = String(req.body.mint || "").trim() || null;
+
+    if (!recipient) {
+      return res.status(400).json({
+        ok: false,
+        error: "recipient_wallet is required",
+      });
+    }
+
+    createUserNotification({
+      recipient_wallet: recipient,
+      actor_wallet: actor || null,
+      type: req.body.type || "test",
+      title: req.body.title || "Moonz notification test",
+      body: req.body.body || "This is a test notification.",
+      mint,
+      data: {
+        token_url: mint ? `/token/${mint}` : null,
+        creator_url: actor ? `/creator/${actor}` : null,
+      },
+      unique_key: req.body.unique_key || null,
+    });
+
+    return res.json({
+      ok: true,
+      unread_count: getUnreadNotificationCount(recipient),
+    });
+  } catch (err) {
+    return res.status(400).json({
+      ok: false,
+      error: err.message || "Failed to create test notification",
+    });
   }
 });
 

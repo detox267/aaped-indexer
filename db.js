@@ -108,6 +108,38 @@ runFollowSecurityMigration();
 
 
 
+
+
+// User notification tables.
+db.exec(`
+CREATE TABLE IF NOT EXISTS user_notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient_wallet TEXT NOT NULL,
+  actor_wallet TEXT,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT,
+  mint TEXT,
+  data_json TEXT,
+  unique_key TEXT,
+  read_at INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS user_notifications_unique_key_idx
+ON user_notifications(recipient_wallet, unique_key)
+WHERE unique_key IS NOT NULL AND unique_key != '';
+
+CREATE INDEX IF NOT EXISTS user_notifications_recipient_idx
+ON user_notifications(recipient_wallet, read_at, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS user_notifications_type_idx
+ON user_notifications(type, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS user_notifications_mint_idx
+ON user_notifications(mint);
+`);
+
 function now() {
   return Math.floor(Date.now() / 1000);
 }
@@ -1478,6 +1510,255 @@ function listFollowing(wallet, limit = 50) {
   return rows.map(publicUserProfile).filter(Boolean);
 }
 
+
+
+function publicNotification(row) {
+  if (!row) return null;
+
+  let data = null;
+
+  try {
+    data = row.data_json ? JSON.parse(row.data_json) : null;
+  } catch {
+    data = null;
+  }
+
+  return {
+    id: row.id,
+    recipient_wallet: row.recipient_wallet,
+    actor_wallet: row.actor_wallet || null,
+    type: row.type,
+    title: row.title,
+    body: row.body || null,
+    mint: row.mint || null,
+    data,
+    read_at: row.read_at || null,
+    created_at: row.created_at || null,
+  };
+}
+
+function createUserNotification({
+  recipient_wallet,
+  actor_wallet = null,
+  type,
+  title,
+  body = null,
+  mint = null,
+  data = null,
+  unique_key = null,
+}) {
+  const recipient = String(recipient_wallet || "").trim();
+
+  if (!recipient) throw new Error("Notification recipient is required");
+  if (!type) throw new Error("Notification type is required");
+  if (!title) throw new Error("Notification title is required");
+
+  const nowTs = now();
+  const dataJson = data ? JSON.stringify(data) : null;
+
+  db.prepare(`
+    INSERT OR IGNORE INTO user_notifications (
+      recipient_wallet,
+      actor_wallet,
+      type,
+      title,
+      body,
+      mint,
+      data_json,
+      unique_key,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    recipient,
+    actor_wallet || null,
+    String(type),
+    String(title),
+    body || null,
+    mint || null,
+    dataJson,
+    unique_key || null,
+    nowTs
+  );
+
+  return true;
+}
+
+function createNotificationsForFollowers({
+  actor_wallet,
+  type,
+  title,
+  body = null,
+  mint = null,
+  data = null,
+  unique_key_prefix = null,
+}) {
+  const actor = String(actor_wallet || "").trim();
+  if (!actor) return { inserted: 0, followers: 0 };
+
+  const followers = db.prepare(`
+    SELECT follower_wallet
+    FROM user_follows
+    WHERE following_wallet = ?
+      AND verified_at IS NOT NULL
+  `).all(actor);
+
+  let inserted = 0;
+
+  const tx = db.transaction(() => {
+    for (const row of followers) {
+      const recipient = String(row.follower_wallet || "").trim();
+      if (!recipient || recipient === actor) continue;
+
+      const uniqueKey = unique_key_prefix
+        ? `${unique_key_prefix}:${recipient}`
+        : null;
+
+      const before = db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM user_notifications
+        WHERE recipient_wallet = ?
+          AND unique_key = ?
+      `).get(recipient, uniqueKey)?.count || 0;
+
+      createUserNotification({
+        recipient_wallet: recipient,
+        actor_wallet: actor,
+        type,
+        title,
+        body,
+        mint,
+        data,
+        unique_key: uniqueKey,
+      });
+
+      const after = db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM user_notifications
+        WHERE recipient_wallet = ?
+          AND unique_key = ?
+      `).get(recipient, uniqueKey)?.count || 0;
+
+      if (after > before) inserted += 1;
+    }
+  });
+
+  tx();
+
+  return {
+    inserted,
+    followers: followers.length,
+  };
+}
+
+function listUserNotifications(wallet, limit = 50) {
+  const clean = String(wallet || "").trim();
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
+
+  if (!clean) return [];
+
+  const rows = db.prepare(`
+    SELECT *
+    FROM user_notifications
+    WHERE recipient_wallet = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+  `).all(clean, safeLimit);
+
+  return rows.map(publicNotification).filter(Boolean);
+}
+
+function getUnreadNotificationCount(wallet) {
+  const clean = String(wallet || "").trim();
+
+  if (!clean) return 0;
+
+  const row = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_notifications
+    WHERE recipient_wallet = ?
+      AND read_at IS NULL
+  `).get(clean);
+
+  return Number(row?.count || 0);
+}
+
+function markNotificationsRead(wallet, ids = []) {
+  const clean = String(wallet || "").trim();
+  const safeIds = Array.isArray(ids)
+    ? ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+    : [];
+
+  if (!clean || !safeIds.length) return 0;
+
+  const nowTs = now();
+  const placeholders = safeIds.map(() => "?").join(",");
+
+  const result = db.prepare(`
+    UPDATE user_notifications
+    SET read_at = COALESCE(read_at, ?)
+    WHERE recipient_wallet = ?
+      AND id IN (${placeholders})
+  `).run(nowTs, clean, ...safeIds);
+
+  return result.changes || 0;
+}
+
+function markAllNotificationsRead(wallet) {
+  const clean = String(wallet || "").trim();
+
+  if (!clean) return 0;
+
+  const result = db.prepare(`
+    UPDATE user_notifications
+    SET read_at = COALESCE(read_at, ?)
+    WHERE recipient_wallet = ?
+      AND read_at IS NULL
+  `).run(now(), clean);
+
+  return result.changes || 0;
+}
+
+function notifyFollowersOfCreatorLaunch({
+  creator,
+  mint,
+  name,
+  symbol,
+  image = null,
+}) {
+  const actor = String(creator || "").trim();
+  const tokenMint = String(mint || "").trim();
+
+  if (!actor || !tokenMint) {
+    return { inserted: 0, followers: 0 };
+  }
+
+  const cleanSymbol = String(symbol || "").trim();
+  const cleanName = String(name || "").trim();
+
+  return createNotificationsForFollowers({
+    actor_wallet: actor,
+    type: "creator_token_launch",
+    title: cleanSymbol
+      ? `New Moonz launch: $${cleanSymbol}`
+      : "New Moonz token launched",
+    body: cleanName
+      ? `${cleanName} was launched by a creator you follow.`
+      : "A creator you follow launched a new token.",
+    mint: tokenMint,
+    data: {
+      creator: actor,
+      mint: tokenMint,
+      name: cleanName || null,
+      symbol: cleanSymbol || null,
+      image: image || null,
+      token_url: `/token/${tokenMint}`,
+      creator_url: `/creator/${actor}`,
+    },
+    unique_key_prefix: `creator_token_launch:${tokenMint}`,
+  });
+}
+
 function getCreatorProfile(address) {
   const tokensCreated = getCreatorTokens(address);
   const trades = getCreatorTrades(address);
@@ -1634,4 +1915,11 @@ module.exports = {
   isFollowing,
   listFollowers,
   listFollowing,
+  createUserNotification,
+  createNotificationsForFollowers,
+  listUserNotifications,
+  getUnreadNotificationCount,
+  markNotificationsRead,
+  markAllNotificationsRead,
+  notifyFollowersOfCreatorLaunch,
 };
