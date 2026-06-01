@@ -487,12 +487,52 @@ app.get("/media/avatar/:wallet", async (req, res) => {
   }
 });
 
+
+function getPublicFollowCounts(wallet) {
+  const clean = cleanWallet(wallet);
+
+  if (!clean) {
+    return {
+      follower_count: 0,
+      raw_follower_count: 0,
+      following_count: 0,
+    };
+  }
+
+  const rawFollowerCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_follows
+    WHERE following_wallet = ?
+  `).get(clean)?.count || 0;
+
+  const verifiedFollowerCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_follows
+    WHERE following_wallet = ?
+      AND verified_at IS NOT NULL
+  `).get(clean)?.count || 0;
+
+  const followingCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_follows
+    WHERE follower_wallet = ?
+  `).get(clean)?.count || 0;
+
+  return {
+    follower_count: Number(verifiedFollowerCount || 0),
+    raw_follower_count: Number(rawFollowerCount || 0),
+    following_count: Number(followingCount || 0),
+  };
+}
+
 app.get("/profile/:wallet", (req, res) => {
   try {
     const wallet = cleanWallet(req.params.wallet);
     if (!wallet) return res.status(400).json({ error: "Wallet is required" });
 
     const profile = getUserProfile(wallet);
+
+    const counts = getPublicFollowCounts(wallet);
 
     return res.json({
       ok: true,
@@ -503,8 +543,9 @@ app.get("/profile/:wallet", (req, res) => {
         display_name: null,
         bio: null,
         avatar_url: null,
-        follower_count: 0,
-        following_count: 0,
+        follower_count: counts.follower_count,
+        raw_follower_count: counts.raw_follower_count,
+        following_count: counts.following_count,
       },
     });
   } catch (err) {
