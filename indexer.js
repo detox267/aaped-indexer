@@ -14,6 +14,7 @@ const {
   setPrice,
   getPrice,
   upsertLaunch,
+  notifyFollowersOnceOfCreatorLaunch,
   upsertTokenStats,
   insertEvent,
   insertTrade,
@@ -1195,6 +1196,35 @@ async function refreshMintState(mint, io = null) {
     treasury_usdc_amount: bigIntToString(balances.treasuryUsdcAmount),
     last_trade_ts: Number(state.lastTradeTs || 0n) || null,
   });
+
+  try {
+    const notifyName = launchMeta?.name || stats?.name || "";
+    const notifySymbol = launchMeta?.symbol || stats?.symbol || "";
+    const notifyImage = mediaUrl || launchMeta?.image || stats?.image || null;
+
+    if (state.creator && mint && (notifyName || notifySymbol)) {
+      const notificationResult = notifyFollowersOnceOfCreatorLaunch({
+        creator: state.creator,
+        mint,
+        name: notifyName,
+        symbol: notifySymbol,
+        image: notifyImage,
+      });
+
+      if (!notificationResult.skipped && notificationResult.followers > 0) {
+        console.log(
+          `[notifications] creator launch ${mint}: ${notificationResult.inserted}/${notificationResult.followers} follower notifications`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[notifications] creator launch notify failed for ${mint}:`,
+      err?.message || err
+    );
+  }
+
+
 
   // Recalculate 24h/since-launch price change after fresh reserve price update.
   // Without this, price_usd can update while price_change_24h_percent remains stale.
