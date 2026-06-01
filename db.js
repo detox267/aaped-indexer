@@ -54,29 +54,58 @@ ON user_follows(following_wallet, created_at DESC);
 `);
 
 
-
-function ensureColumn(table, column, ddl) {
+function addColumnIfMissing(table, column, ddl) {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+
   if (!rows.some((row) => row.name === column)) {
-    db.exec(ddl);
+    db.prepare(ddl).run();
   }
 }
 
-ensureColumn("user_follows", "verified_at", `
-  ALTER TABLE user_follows ADD COLUMN verified_at INTEGER
-`);
+function runFollowSecurityMigration() {
+  const tables = db.prepare(`
+    SELECT name
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name = 'user_follows'
+  `).all();
 
-ensureColumn("user_follows", "verified_reason", `
-  ALTER TABLE user_follows ADD COLUMN verified_reason TEXT
-`);
+  if (!tables.length) {
+    return;
+  }
 
-ensureColumn("user_follows", "follower_sol_lamports", `
-  ALTER TABLE user_follows ADD COLUMN follower_sol_lamports TEXT
-`);
+  addColumnIfMissing(
+    "user_follows",
+    "verified_at",
+    "ALTER TABLE user_follows ADD COLUMN verified_at INTEGER"
+  );
 
-ensureColumn("user_follows", "follower_profile_created_at", `
-  ALTER TABLE user_follows ADD COLUMN follower_profile_created_at INTEGER
-`);
+  addColumnIfMissing(
+    "user_follows",
+    "verified_reason",
+    "ALTER TABLE user_follows ADD COLUMN verified_reason TEXT"
+  );
+
+  addColumnIfMissing(
+    "user_follows",
+    "follower_sol_lamports",
+    "ALTER TABLE user_follows ADD COLUMN follower_sol_lamports TEXT"
+  );
+
+  addColumnIfMissing(
+    "user_follows",
+    "follower_profile_created_at",
+    "ALTER TABLE user_follows ADD COLUMN follower_profile_created_at INTEGER"
+  );
+}
+
+runFollowSecurityMigration();
+
+
+
+
+
+
 
 
 function now() {
