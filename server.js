@@ -5,6 +5,8 @@ const path = require("path");
 const crypto = require("crypto");
 const fetch = globalThis.fetch || require("node-fetch");
 const sharp = require("sharp");
+const nacl = require("tweetnacl");
+const { PublicKey } = require("@solana/web3.js");
 
 const express = require("express");
 const http = require("http");
@@ -47,6 +49,18 @@ const PUBLIC_INDEXER_BASE_URL =
   process.env.PUBLIC_INDEXER_BASE_URL ||
   process.env.PUBLIC_INDEXER_BASE ||
   "https://indexer.moonz.fun";
+
+const FOLLOW_RATE_LIMIT_WINDOW_MS = Number(process.env.FOLLOW_RATE_LIMIT_WINDOW_MS || 60_000);
+const FOLLOW_RATE_LIMIT_MAX = Number(process.env.FOLLOW_RATE_LIMIT_MAX || 20);
+const MIN_VERIFIED_FOLLOWER_SOL_LAMPORTS = BigInt(
+  process.env.MIN_VERIFIED_FOLLOWER_SOL_LAMPORTS || "0"
+);
+const SOLANA_RPC_HTTP =
+  process.env.RPC_HTTP ||
+  process.env.SOLANA_RPC_HTTP ||
+  process.env.HELIUS_RPC_HTTP ||
+  process.env.HTTP_RPC ||
+  "";
 
 fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
 fs.mkdirSync(AVATAR_CACHE_DIR, { recursive: true });
@@ -272,6 +286,188 @@ function parseDataUrlImage(value) {
   };
 }
 
+
+
+const followRateMap = new Map();
+
+function clientIp(req) {
+  return String(
+    req.headers["x-forwarded-for"] ||
+      req.socket?.remoteAddress ||
+      req.ip ||
+      ""
+  ).split(",")[0].trim();
+}
+
+function checkFollowRateLimit(req) {
+  const ip = clientIp(req) || "unknown";
+  const nowMs = Date.now();
+  const key = `follow:${ip}`;
+
+  const bucket = followRateMap.get(key) || {
+    resetAt: nowMs + FOLLOW_RATE_LIMIT_WINDOW_MS,
+    count: 0,
+  };
+
+  if (nowMs > bucket.resetAt) {
+    bucket.resetAt = nowMs + FOLLOW_RATE_LIMIT_WINDOW_MS;
+    bucket.count = 0;
+  }
+
+  bucket.count += 1;
+  followRateMap.set(key, bucket);
+
+  if (bucket.count > FOLLOW_RATE_LIMIT_MAX) {
+    const waitSeconds = Math.max(1, Math.ceil((bucket.resetAt - nowMs) / 1000));
+    const err = new Error(`Too many follow actions. Try again in ${waitSeconds}s`);
+    err.status = 429;
+    throw err;
+  }
+}
+
+function parseBase64Bytes(value, label) {
+  if (!value) throw new Error(`${label} is required`);
+  const buf = Buffer.from(String(value), "base64");
+  if (!buf.length) throw new Error(`${label} is invalid`);
+  return new Uint8Array(buf);
+}
+
+function verifyWalletMessage({ wallet, message, signature }) {
+  const cleanWallet = cleanWalletValue(wallet);
+
+  const publicKey = new PublicKey(cleanWallet);
+  const encodedMessage = new TextEncoder().encode(String(message || ""));
+  const sigBytes = parseBase64Bytes(signature, "Signature");
+
+  const ok = nacl.sign.detached.verify(
+    encodedMessage,
+    sigBytes,
+    publicKey.toBytes()
+  );
+
+  if (!ok) {
+    throw new Error("Invalid wallet signature");
+  }
+
+  return true;
+}
+
+function cleanWalletValue(value) {
+  return String(value || "").trim();
+}
+
+function requireFreshTimestamp(timestamp) {
+  const ts = Number(timestamp || 0);
+  const nowMs = Date.now();
+
+  if (!Number.isFinite(ts) || ts <= 0) {
+    throw new Error("Invalid timestamp");
+  }
+
+  if (Math.abs(nowMs - ts) > 5 * 60 * 1000) {
+    throw new Error("Signature timestamp expired");
+  }
+
+  return ts;
+}
+
+function expectedFollowMessage({ action, followerWallet, followingWallet, timestamp }) {
+  const cleanAction = action === "unfollow" ? "unfollow" : "follow";
+  return `Moonz ${cleanAction} creator ${followingWallet} from ${followerWallet} at ${timestamp}`;
+}
+
+async function getSolBalanceLamports(wallet) {
+  if (!SOLANA_RPC_HTTP) return null;
+
+  try {
+    const response = await fetch(SOLANA_RPC_HTTP, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "moonz-follow-balance",
+        method: "getBalance",
+        params: [wallet, { commitment: "confirmed" }],
+      }),
+    });
+
+    const data = await response.json();
+    const value = data?.result?.value;
+
+    if (typeof value === "number") return BigInt(value);
+    return null;
+  } catch (err) {
+    console.warn("[follow] balance check failed:", err?.message || err);
+    return null;
+  }
+}
+
+async function verifiedFollowOptions(followerWallet) {
+  const solLamports = await getSolBalanceLamports(followerWallet);
+
+  if (
+    MIN_VERIFIED_FOLLOWER_SOL_LAMPORTS > 0n &&
+    (solLamports === null || solLamports < MIN_VERIFIED_FOLLOWER_SOL_LAMPORTS)
+  ) {
+    return {
+      verified: false,
+      verifiedReason: "signed_profile_no_min_balance",
+      followerSolLamports: solLamports === null ? null : solLamports.toString(),
+    };
+  }
+
+  return {
+    verified: true,
+    verifiedReason:
+      MIN_VERIFIED_FOLLOWER_SOL_LAMPORTS > 0n
+        ? "signed_profile_balance"
+        : "signed_profile",
+    followerSolLamports: solLamports === null ? null : solLamports.toString(),
+  };
+}
+
+function requireSignedFollowBody(req, action) {
+  const followerWallet = cleanWalletValue(req.body.follower_wallet || req.body.follower);
+  const followingWallet = cleanWalletValue(req.body.following_wallet || req.body.following);
+  const timestamp = requireFreshTimestamp(req.body.timestamp);
+  const message = String(req.body.message || "");
+  const signature = String(req.body.signature || "");
+
+  if (!followerWallet || !followingWallet) {
+    throw new Error("Follower and following wallets are required");
+  }
+
+  if (followerWallet === followingWallet) {
+    throw new Error("You cannot follow yourself");
+  }
+
+  const expected = expectedFollowMessage({
+    action,
+    followerWallet,
+    followingWallet,
+    timestamp,
+  });
+
+  if (message !== expected) {
+    throw new Error("Signed message mismatch");
+  }
+
+  verifyWalletMessage({
+    wallet: followerWallet,
+    message,
+    signature,
+  });
+
+  return {
+    followerWallet,
+    followingWallet,
+    timestamp,
+  };
+}
+
+
 app.get("/media/avatar/:wallet", async (req, res) => {
   try {
     const wallet = cleanWallet(req.params.wallet);
@@ -434,16 +630,21 @@ app.post("/profile/avatar", async (req, res) => {
   }
 });
 
-app.post("/follow", (req, res) => {
+app.post("/follow", async (req, res) => {
   try {
-    const follower = cleanWallet(req.body.follower_wallet || req.body.follower);
-    const following = cleanWallet(req.body.following_wallet || req.body.following);
+    checkFollowRateLimit(req);
 
-    const result = followUser(follower, following);
+    const { followerWallet, followingWallet } = requireSignedFollowBody(req, "follow");
+
+    const options = await verifiedFollowOptions(followerWallet);
+
+    const result = followUser(followerWallet, followingWallet, options);
 
     return res.json(result);
   } catch (err) {
-    return res.status(400).json({
+    const status = err.status || 400;
+
+    return res.status(status).json({
       ok: false,
       error: err.message || "Failed to follow user",
     });
@@ -452,14 +653,17 @@ app.post("/follow", (req, res) => {
 
 app.post("/unfollow", (req, res) => {
   try {
-    const follower = cleanWallet(req.body.follower_wallet || req.body.follower);
-    const following = cleanWallet(req.body.following_wallet || req.body.following);
+    checkFollowRateLimit(req);
 
-    const result = unfollowUser(follower, following);
+    const { followerWallet, followingWallet } = requireSignedFollowBody(req, "unfollow");
+
+    const result = unfollowUser(followerWallet, followingWallet);
 
     return res.json(result);
   } catch (err) {
-    return res.status(400).json({
+    const status = err.status || 400;
+
+    return res.status(status).json({
       ok: false,
       error: err.message || "Failed to unfollow user",
     });

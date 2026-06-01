@@ -53,6 +53,32 @@ CREATE INDEX IF NOT EXISTS user_follows_following_idx
 ON user_follows(following_wallet, created_at DESC);
 `);
 
+
+
+function ensureColumn(table, column, ddl) {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!rows.some((row) => row.name === column)) {
+    db.exec(ddl);
+  }
+}
+
+ensureColumn("user_follows", "verified_at", `
+  ALTER TABLE user_follows ADD COLUMN verified_at INTEGER
+`);
+
+ensureColumn("user_follows", "verified_reason", `
+  ALTER TABLE user_follows ADD COLUMN verified_reason TEXT
+`);
+
+ensureColumn("user_follows", "follower_sol_lamports", `
+  ALTER TABLE user_follows ADD COLUMN follower_sol_lamports TEXT
+`);
+
+ensureColumn("user_follows", "follower_profile_created_at", `
+  ALTER TABLE user_follows ADD COLUMN follower_profile_created_at INTEGER
+`);
+
+
 function now() {
   return Math.floor(Date.now() / 1000);
 }
@@ -1128,10 +1154,17 @@ function publicUserProfile(row) {
 
   const wallet = String(row.wallet || "");
 
+  const rawFollowerCount = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_follows
+    WHERE following_wallet = ?
+  `).get(wallet)?.count || 0;
+
   const followerCount = db.prepare(`
     SELECT COUNT(*) AS count
     FROM user_follows
     WHERE following_wallet = ?
+      AND verified_at IS NOT NULL
   `).get(wallet)?.count || 0;
 
   const followingCount = db.prepare(`
@@ -1150,6 +1183,7 @@ function publicUserProfile(row) {
     avatar_url: row.avatar_url || null,
     avatar_updated_at: row.avatar_updated_at || null,
     follower_count: Number(followerCount || 0),
+    raw_follower_count: Number(rawFollowerCount || 0),
     following_count: Number(followingCount || 0),
     created_at: row.created_at || null,
     updated_at: row.updated_at || null,
@@ -1277,29 +1311,64 @@ function upsertUserProfile({ wallet, username, display_name, bio, avatar_url }) 
   return getUserProfile(cleanWallet);
 }
 
-function followUser(followerWallet, followingWallet) {
+function followUser(followerWallet, followingWallet, options = {}) {
   const follower = String(followerWallet || "").trim();
   const following = String(followingWallet || "").trim();
 
   if (!follower || !following) throw new Error("Follower and following wallets are required");
   if (follower === following) throw new Error("You cannot follow yourself");
 
+  const followerProfile = db.prepare(`
+    SELECT *
+    FROM user_profiles
+    WHERE wallet = ?
+  `).get(follower);
+
+  if (!followerProfile) {
+    throw new Error("Create a profile before following creators");
+  }
+
   const nowTs = now();
 
+  const verifiedAt = options.verified ? nowTs : null;
+  const verifiedReason = options.verifiedReason || null;
+  const followerSolLamports =
+    options.followerSolLamports !== undefined && options.followerSolLamports !== null
+      ? String(options.followerSolLamports)
+      : null;
+
   db.prepare(`
-    INSERT OR IGNORE INTO user_follows (
+    INSERT INTO user_follows (
       follower_wallet,
       following_wallet,
-      created_at
+      created_at,
+      verified_at,
+      verified_reason,
+      follower_sol_lamports,
+      follower_profile_created_at
     )
-    VALUES (?, ?, ?)
-  `).run(follower, following, nowTs);
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(follower_wallet, following_wallet) DO UPDATE SET
+      verified_at = COALESCE(excluded.verified_at, user_follows.verified_at),
+      verified_reason = COALESCE(excluded.verified_reason, user_follows.verified_reason),
+      follower_sol_lamports = COALESCE(excluded.follower_sol_lamports, user_follows.follower_sol_lamports),
+      follower_profile_created_at = COALESCE(excluded.follower_profile_created_at, user_follows.follower_profile_created_at)
+  `).run(
+    follower,
+    following,
+    nowTs,
+    verifiedAt,
+    verifiedReason,
+    followerSolLamports,
+    followerProfile.created_at || nowTs
+  );
 
   return {
     ok: true,
     follower_wallet: follower,
     following_wallet: following,
     following: true,
+    verified: Boolean(verifiedAt),
   };
 }
 
