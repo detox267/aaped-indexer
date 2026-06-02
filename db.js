@@ -3,6 +3,70 @@ const path = require("path");
 const Database = require("better-sqlite3");
 require("dotenv").config();
 
+let createClient = null;
+try {
+  ({ createClient } = require("redis"));
+} catch {
+  createClient = null;
+}
+
+const LIVE_EVENT_CHANNEL = process.env.LIVE_EVENT_CHANNEL || "moonz:events";
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+
+let notificationRedisClient = null;
+let notificationRedisConnecting = null;
+
+async function getNotificationRedisClient() {
+  if (!createClient) return null;
+
+  if (notificationRedisClient?.isOpen) {
+    return notificationRedisClient;
+  }
+
+  if (notificationRedisConnecting) {
+    return notificationRedisConnecting;
+  }
+
+  notificationRedisClient = createClient({ url: REDIS_URL });
+  notificationRedisClient.on("error", (err) => {
+    console.warn("[notifications-redis] publish error:", err?.message || err);
+  });
+
+  notificationRedisConnecting = notificationRedisClient
+    .connect()
+    .then(() => notificationRedisClient)
+    .catch((err) => {
+      console.warn("[notifications-redis] connect failed:", err?.message || err);
+      notificationRedisClient = null;
+      return null;
+    })
+    .finally(() => {
+      notificationRedisConnecting = null;
+    });
+
+  return notificationRedisConnecting;
+}
+
+function publishNotificationCreated(notification) {
+  if (!notification?.recipient_wallet) return;
+
+  const event = {
+    type: "notification.created",
+    recipient_wallet: notification.recipient_wallet,
+    notification,
+  };
+
+  getNotificationRedisClient()
+    .then((client) => {
+      if (!client) return null;
+      return client.publish(LIVE_EVENT_CHANNEL, JSON.stringify(event));
+    })
+    .catch((err) => {
+      console.warn("[notifications-redis] publish failed:", err?.message || err);
+    });
+}
+
+
 const TOKENS_DB = process.env.TOKENS_DB || path.join(__dirname, "tokens.db");
 fs.mkdirSync(path.dirname(TOKENS_DB), { recursive: true });
 
@@ -1589,7 +1653,7 @@ function createUserNotification({
   const nowTs = now();
   const dataJson = data ? JSON.stringify(data) : null;
 
-  db.prepare(`
+  const result = db.prepare(`
     INSERT OR IGNORE INTO user_notifications (
       recipient_wallet,
       actor_wallet,
@@ -1614,7 +1678,21 @@ function createUserNotification({
     nowTs
   );
 
-  return true;
+  if (!result.changes) {
+    return true;
+  }
+
+  const row = db.prepare(`
+    SELECT *
+    FROM user_notifications
+    WHERE id = ?
+  `).get(result.lastInsertRowid);
+
+  const notification = publicNotification(row);
+
+  publishNotificationCreated(notification);
+
+  return notification || true;
 }
 
 function createNotificationsForFollowers({
