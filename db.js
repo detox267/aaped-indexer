@@ -1568,14 +1568,6 @@ CREATE TABLE IF NOT EXISTS token_migration_notifications_sent (
   creator TEXT,
   sent_at INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS creator_fee_notifications_sent (
-  creator TEXT NOT NULL,
-  mint TEXT NOT NULL,
-  bucket TEXT NOT NULL,
-  sent_at INTEGER NOT NULL,
-  PRIMARY KEY (creator, mint, bucket)
-);
 `);
 
 function createUserNotification({
@@ -2288,7 +2280,6 @@ module.exports = {
   listFollowing,
   createUserNotification,
   createNotificationsForFollowers,
-  notifyCreatorFeeClaimableOnce,
   notifyTokenMigratedAmmOnce,
   notifyTokenHitKingOnce,
   notifyWalletFollowed,
