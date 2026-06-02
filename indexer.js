@@ -14,6 +14,8 @@ const {
   setPrice,
   getPrice,
   upsertLaunch,
+  notifyTokenMigratedAmmOnce,
+  notifyTokenHitKingOnce,
   notifyFollowersOnceOfCreatorLaunch,
   upsertTokenStats,
   insertEvent,
@@ -1196,6 +1198,20 @@ async function refreshMintState(mint, io = null) {
     treasury_usdc_amount: bigIntToString(balances.treasuryUsdcAmount),
     last_trade_ts: Number(state.lastTradeTs || 0n) || null,
   });
+
+  try {
+    if (["amm_live", "migrated"].includes(String(stats?.phase || state?.phase || "").toLowerCase())) {
+      const migrationResult = notifyTokenMigratedAmmOnce({ mint });
+
+      if (!migrationResult.skipped) {
+        console.log(`[notifications] AMM migration notification sent for ${mint}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[notifications] AMM migration notify failed for ${mint}:`, err?.message || err);
+  }
+
+
 
   try {
     const notifyName = launchMeta?.name || stats?.name || "";
@@ -2664,6 +2680,23 @@ function publishKingOfMoonzSnapshot(reason = "tick") {
     if (typeof publishLiveEvent !== "function") return;
 
     const snapshot = getKingOfMoonzSnapshot();
+
+    try {
+      if (snapshot?.king?.mint) {
+        const kingNotifyResult = notifyTokenHitKingOnce({
+          mint: snapshot.king.mint,
+          hour_start: snapshot.hour_start,
+        });
+
+        if (!kingNotifyResult.skipped) {
+          console.log(`[notifications] King notification sent for ${snapshot.king.mint}`);
+        }
+      }
+    } catch (err) {
+      console.warn("[notifications] King notify failed:", err?.message || err);
+    }
+
+
 
     const compact = JSON.stringify({
       king: snapshot.king?.mint || null,

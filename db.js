@@ -1553,6 +1553,31 @@ function publicNotification(row) {
   };
 }
 
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS token_king_notifications_sent (
+  mint TEXT NOT NULL,
+  hour_start INTEGER NOT NULL,
+  creator TEXT,
+  sent_at INTEGER NOT NULL,
+  PRIMARY KEY (mint, hour_start)
+);
+
+CREATE TABLE IF NOT EXISTS token_migration_notifications_sent (
+  mint TEXT PRIMARY KEY,
+  creator TEXT,
+  sent_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS creator_fee_notifications_sent (
+  creator TEXT NOT NULL,
+  mint TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  sent_at INTEGER NOT NULL,
+  PRIMARY KEY (creator, mint, bucket)
+);
+`);
+
 function createUserNotification({
   recipient_wallet,
   actor_wallet = null,
@@ -1840,6 +1865,271 @@ function notifyFollowersOnceOfCreatorLaunch({
   };
 }
 
+
+function getTokenNotificationMeta(mint) {
+  const cleanMint = String(mint || "").trim();
+
+  if (!cleanMint) return null;
+
+  return db.prepare(`
+    SELECT
+      l.mint,
+      l.creator,
+      COALESCE(ts.name, l.name) AS name,
+      COALESCE(ts.symbol, l.symbol) AS symbol,
+      COALESCE(ts.image, l.image) AS image,
+      COALESCE(ts.phase, l.phase) AS phase,
+      COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
+    FROM launches l
+    LEFT JOIN token_stats ts ON ts.mint = l.mint
+    WHERE l.mint = ?
+  `).get(cleanMint);
+}
+
+function notifyWalletFollowed({ follower, following }) {
+  const followerWallet = String(follower || "").trim();
+  const followingWallet = String(following || "").trim();
+
+  if (!followerWallet || !followingWallet || followerWallet === followingWallet) {
+    return { inserted: 0, skipped: true };
+  }
+
+  const followerProfile = getUserProfile(followerWallet);
+  const followerName =
+    followerProfile?.display_username ||
+    followerProfile?.username ||
+    `${followerWallet.slice(0, 4)}...${followerWallet.slice(-4)}`;
+
+  const uniqueKey = `creator_followed_you:${followingWallet}:${followerWallet}`;
+
+  const before = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_notifications
+    WHERE recipient_wallet = ?
+      AND unique_key = ?
+  `).get(followingWallet, uniqueKey)?.count || 0;
+
+  createUserNotification({
+    recipient_wallet: followingWallet,
+    actor_wallet: followerWallet,
+    type: "creator_followed_you",
+    title: `${followerName} followed you`,
+    body: "A Moonz user followed your creator profile.",
+    mint: null,
+    data: {
+      follower_wallet: followerWallet,
+      follower_username: followerProfile?.username || null,
+      creator_url: `/creator/${followerWallet}`,
+    },
+    unique_key: uniqueKey,
+  });
+
+  const after = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM user_notifications
+    WHERE recipient_wallet = ?
+      AND unique_key = ?
+  `).get(followingWallet, uniqueKey)?.count || 0;
+
+  return { inserted: after > before ? 1 : 0, skipped: after <= before };
+}
+
+function notifyTokenHitKingOnce({ mint, hour_start = null }) {
+  const token = getTokenNotificationMeta(mint);
+
+  if (!token?.mint || !token?.creator) {
+    return { inserted: 0, skipped: true, reason: "missing_token_or_creator" };
+  }
+
+  const hourStart = Number(hour_start || Math.floor(Date.now() / 3600000) * 3600000);
+
+  const marker = db.prepare(`
+    INSERT OR IGNORE INTO token_king_notifications_sent (
+      mint,
+      hour_start,
+      creator,
+      sent_at
+    )
+    VALUES (?, ?, ?, ?)
+  `).run(token.mint, hourStart, token.creator, now());
+
+  if (!marker.changes) {
+    return { inserted: 0, skipped: true, reason: "already_sent" };
+  }
+
+  const symbol = String(token.symbol || "").trim();
+  const name = String(token.name || "").trim();
+
+  createUserNotification({
+    recipient_wallet: token.creator,
+    actor_wallet: token.creator,
+    type: "token_hit_king",
+    title: symbol ? `$${symbol} became King of the Moonz` : "Your token became King of the Moonz",
+    body: name ? `${name} is leading hourly Moonz volume.` : "Your token is leading hourly Moonz volume.",
+    mint: token.mint,
+    data: {
+      mint: token.mint,
+      name: name || null,
+      symbol: symbol || null,
+      image: token.image || null,
+      token_url: `/token/${token.mint}`,
+      creator_url: `/creator/${token.creator}`,
+    },
+    unique_key: `token_hit_king:${token.mint}:${hourStart}`,
+  });
+
+  return { inserted: 1, skipped: false };
+}
+
+function notifyTokenMigratedAmmOnce({ mint }) {
+  const token = getTokenNotificationMeta(mint);
+
+  if (!token?.mint || !token?.creator) {
+    return { inserted: 0, skipped: true, reason: "missing_token_or_creator" };
+  }
+
+  const phase = String(token.phase || "").toLowerCase();
+
+  if (!["amm_live", "migrated"].includes(phase)) {
+    return { inserted: 0, skipped: true, reason: "not_amm_live" };
+  }
+
+  const marker = db.prepare(`
+    INSERT OR IGNORE INTO token_migration_notifications_sent (
+      mint,
+      creator,
+      sent_at
+    )
+    VALUES (?, ?, ?)
+  `).run(token.mint, token.creator, now());
+
+  if (!marker.changes) {
+    return { inserted: 0, skipped: true, reason: "already_sent" };
+  }
+
+  const symbol = String(token.symbol || "").trim();
+  const name = String(token.name || "").trim();
+
+  createUserNotification({
+    recipient_wallet: token.creator,
+    actor_wallet: token.creator,
+    type: "token_migrated_amm",
+    title: symbol ? `$${symbol} is now AMM live` : "Your token is now AMM live",
+    body: name ? `${name} migrated from bonding to AMM live.` : "Your token migrated from bonding to AMM live.",
+    mint: token.mint,
+    data: {
+      mint: token.mint,
+      name: name || null,
+      symbol: symbol || null,
+      image: token.image || null,
+      token_url: `/token/${token.mint}`,
+      creator_url: `/creator/${token.creator}`,
+    },
+    unique_key: `token_migrated_amm:${token.mint}`,
+  });
+
+  return { inserted: 1, skipped: false };
+}
+
+function notifyCreatorFeeClaimableOnce({
+  creator,
+  mint,
+  amountUsd = 0,
+  bucket = "default",
+}) {
+  const cleanCreator = String(creator || "").trim();
+  const cleanMint = String(mint || "").trim();
+
+  if (!cleanCreator || !cleanMint) {
+    return { inserted: 0, skipped: true, reason: "missing_creator_or_mint" };
+  }
+
+  const token = getTokenNotificationMeta(cleanMint) || {};
+  const cleanBucket = String(bucket || "default").trim();
+
+  const marker = db.prepare(`
+    INSERT OR IGNORE INTO creator_fee_notifications_sent (
+      creator,
+      mint,
+      bucket,
+      sent_at
+    )
+    VALUES (?, ?, ?, ?)
+  `).run(cleanCreator, cleanMint, cleanBucket, now());
+
+  if (!marker.changes) {
+    return { inserted: 0, skipped: true, reason: "already_sent" };
+  }
+
+  const symbol = String(token.symbol || "").trim();
+
+  createUserNotification({
+    recipient_wallet: cleanCreator,
+    actor_wallet: cleanCreator,
+    type: "creator_fee_claimable",
+    title: symbol ? `Creator fees available for $${symbol}` : "Creator fees available",
+    body:
+      Number(amountUsd || 0) > 0
+        ? `You have creator fees available. Estimated value: $${Number(amountUsd).toFixed(2)}.`
+        : "You have creator fees available to review.",
+    mint: cleanMint,
+    data: {
+      mint: cleanMint,
+      symbol: symbol || null,
+      amount_usd: Number(amountUsd || 0),
+      token_url: `/token/${cleanMint}`,
+      creator_url: `/creator/${cleanCreator}`,
+    },
+    unique_key: `creator_fee_claimable:${cleanCreator}:${cleanMint}:${cleanBucket}`,
+  });
+
+  return { inserted: 1, skipped: false };
+}
+
+function seedExistingNotificationMarkers() {
+  db.prepare(`
+    INSERT OR IGNORE INTO creator_launch_notifications_sent (
+      mint,
+      creator,
+      followers_count,
+      inserted_count,
+      sent_at
+    )
+    SELECT
+      mint,
+      COALESCE(creator, ''),
+      0,
+      0,
+      strftime('%s','now')
+    FROM launches
+    WHERE mint IS NOT NULL
+      AND mint != ''
+      AND creator IS NOT NULL
+      AND creator != ''
+  `).run();
+
+  db.prepare(`
+    INSERT OR IGNORE INTO token_migration_notifications_sent (
+      mint,
+      creator,
+      sent_at
+    )
+    SELECT
+      mint,
+      COALESCE(creator, ''),
+      strftime('%s','now')
+    FROM launches
+    WHERE mint IS NOT NULL
+      AND mint != ''
+      AND creator IS NOT NULL
+      AND creator != ''
+      AND LOWER(COALESCE(phase, '')) IN ('amm_live', 'migrated')
+  `).run();
+}
+
+seedExistingNotificationMarkers();
+
+
 function getCreatorProfile(address) {
   const tokensCreated = getCreatorTokens(address);
   const trades = getCreatorTrades(address);
@@ -1998,6 +2288,10 @@ module.exports = {
   listFollowing,
   createUserNotification,
   createNotificationsForFollowers,
+  notifyCreatorFeeClaimableOnce,
+  notifyTokenMigratedAmmOnce,
+  notifyTokenHitKingOnce,
+  notifyWalletFollowed,
   listUserNotifications,
   getUnreadNotificationCount,
   markNotificationsRead,

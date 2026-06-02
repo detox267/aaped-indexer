@@ -28,6 +28,7 @@ const {
   isUsernameAvailable,
   upsertUserProfile,
   followUser,
+  notifyWalletFollowed,
   unfollowUser,
   isFollowing,
   listFollowers,
@@ -686,6 +687,17 @@ app.post("/follow", async (req, res) => {
     const options = await verifiedFollowOptions(followerWallet);
 
     const result = followUser(followerWallet, followingWallet, options);
+
+    if (result?.following) {
+      try {
+        notifyWalletFollowed({
+          follower: followerWallet,
+          following: followingWallet,
+        });
+      } catch (notifyErr) {
+        console.warn("[notifications] follow notification failed:", notifyErr?.message || notifyErr);
+      }
+    }
 
     return res.json(result);
   } catch (err) {
