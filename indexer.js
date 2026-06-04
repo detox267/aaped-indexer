@@ -212,6 +212,10 @@ function liveDedupeSignature(event) {
       trades_24h: st.trades_24h,
       tokens_sold: st.tokens_sold,
       tokens_remaining: st.tokens_remaining,
+      lp_vault_amount: st.lp_vault_amount,
+      treasury_wsol_amount: st.treasury_wsol_amount,
+      treasury_usdc_amount: st.treasury_usdc_amount,
+      sale_vault_amount: st.sale_vault_amount,
       phase: st.phase,
       quote_asset: st.quote_asset,
     });
@@ -275,6 +279,33 @@ function compactLiveStats(stats = {}) {
 
     tokens_sold: stats.tokens_sold,
     tokens_remaining: stats.tokens_remaining,
+
+    sol_collected: stats.sol_collected,
+    sol_collected_lamports: stats.sol_collected_lamports || stats.sol_collected,
+
+    liquidity_sol: stats.liquidity_sol,
+    liquidity_usd: stats.liquidity_usd,
+
+    sale_vault_amount: stats.sale_vault_amount,
+    lp_vault_amount: stats.lp_vault_amount,
+    treasury_wsol_amount: stats.treasury_wsol_amount,
+    treasury_usdc_amount: stats.treasury_usdc_amount,
+
+    sale_vault: stats.sale_vault,
+    lp_vault: stats.lp_vault,
+    treasury_wsol_vault: stats.treasury_wsol_vault,
+    treasury_usdc_vault: stats.treasury_usdc_vault,
+
+    pool_token_reserve: stats.lp_vault_amount,
+    pool_quote_reserve:
+      stats.quote_asset === "USDC"
+        ? stats.treasury_usdc_amount
+        : stats.treasury_wsol_amount,
+    amm_token_reserve: stats.lp_vault_amount,
+    amm_quote_reserve:
+      stats.quote_asset === "USDC"
+        ? stats.treasury_usdc_amount
+        : stats.treasury_wsol_amount,
 
     price_change_24h_percent: stats.price_change_24h_percent,
     price_change_24h_usd: stats.price_change_24h_usd,
@@ -455,6 +486,27 @@ function compactStats(stats = {}) {
 
     liquidity_sol: stats.liquidity_sol,
     liquidity_usd: stats.liquidity_usd,
+
+    sale_vault_amount: stats.sale_vault_amount,
+    lp_vault_amount: stats.lp_vault_amount,
+    treasury_wsol_amount: stats.treasury_wsol_amount,
+    treasury_usdc_amount: stats.treasury_usdc_amount,
+
+    sale_vault: stats.sale_vault,
+    lp_vault: stats.lp_vault,
+    treasury_wsol_vault: stats.treasury_wsol_vault,
+    treasury_usdc_vault: stats.treasury_usdc_vault,
+
+    pool_token_reserve: stats.lp_vault_amount,
+    pool_quote_reserve:
+      stats.quote_asset === "USDC"
+        ? stats.treasury_usdc_amount
+        : stats.treasury_wsol_amount,
+    amm_token_reserve: stats.lp_vault_amount,
+    amm_quote_reserve:
+      stats.quote_asset === "USDC"
+        ? stats.treasury_usdc_amount
+        : stats.treasury_wsol_amount,
 
     total_supply: stats.total_supply,
     sale_supply: stats.sale_supply,
@@ -1173,14 +1225,24 @@ async function refreshMintState(mint, io = null) {
     marketcap_sol: computed.marketcapSol,
     marketcap_usd: computed.marketcapUsd,
 
-    // Bonding curve quote reserve / collected SOL.
-    // UI uses this for "SOL Collected" and bonding liquidity.
+    // Bonding uses collected quote. AMM live uses actual pool quote vault.
     sol_collected: bigIntToString(state.solCollected),
     sol_collected_lamports: bigIntToString(state.solCollected),
-    liquidity_sol: Number(state.solCollected || 0n) / 1_000_000_000,
+    liquidity_sol:
+      ["amm_live", "amm", "switching"].includes(String(state.phase || "").toLowerCase())
+        ? state.quoteAsset === "USDC"
+          ? (Number(balances.treasuryUsdcAmount || 0n) / 1_000_000)
+              / Number(solUsd || 1)
+          : Number(balances.treasuryWsolAmount || 0n) / 1_000_000_000
+        : Number(state.solCollected || 0n) / 1_000_000_000,
     liquidity_usd:
-      (Number(state.solCollected || 0n) / 1_000_000_000) *
-      Number(solUsd || 0),
+      ["amm_live", "amm", "switching"].includes(String(state.phase || "").toLowerCase())
+        ? state.quoteAsset === "USDC"
+          ? Number(balances.treasuryUsdcAmount || 0n) / 1_000_000
+          : (Number(balances.treasuryWsolAmount || 0n) / 1_000_000_000) *
+            Number(solUsd || 0)
+        : (Number(state.solCollected || 0n) / 1_000_000_000) *
+          Number(solUsd || 0),
 
     total_supply: bigIntToString(computed.totalSupply),
     sale_supply: bigIntToString(computed.saleSupply),
