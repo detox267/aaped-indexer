@@ -101,6 +101,7 @@ const PHASE_BY_U8 = {
   1: "bonding",
   2: "amm_live",
   3: "switching",
+  4: "cancelled",
 };
 
 const QUOTE_BY_U8 = {
@@ -802,7 +803,7 @@ function decodeLaunchState(buf) {
     const quoteAssetU8 = numberField(decoded.quoteAsset ?? decoded.quote_asset ?? decoded.quoteAssetU8, 999);
     const saleSupply = toBigIntMaybe(decoded.saleSupply ?? decoded.sale_supply, 0n);
 
-    if (stateU8 < 0 || stateU8 > 3) return false;
+    if (stateU8 < 0 || stateU8 > 4) return false;
     if (quoteAssetU8 < 0 || quoteAssetU8 > 1) return false;
     if (saleSupply <= 0n || saleSupply > TOTAL_SUPPLY_BASE) return false;
 
@@ -870,6 +871,14 @@ function decodeLaunchState(buf) {
           decoded.switchFeeEscrowedLamports ?? decoded.switch_fee_escrowed_lamports,
           0n
         ),
+        switchAmountIn: toBigIntMaybe(
+          decoded.switchAmountIn ?? decoded.switch_amount_in,
+          0n
+        ),
+        switchMinAmountOut: toBigIntMaybe(
+          decoded.switchMinAmountOut ?? decoded.switch_min_amount_out,
+          0n
+        ),
         switchSwapExecuted: boolField(decoded.switchSwapExecuted ?? decoded.switch_swap_executed),
 
         feeTotalBps: TRADE_FEE_BPS,
@@ -893,6 +902,9 @@ function decodeLaunchState(buf) {
   }
 
   // Fallback manual decode for the current compact layout.
+  // Reject shorter or legacy layouts before reading fixed offsets.
+  if (buf.length < 386) return null;
+
   let o = 8;
 
   const bump = readU8(buf, o); o += 1;
@@ -906,6 +918,9 @@ function decodeLaunchState(buf) {
 
   const mint = readPubkey(buf, o); o += 32;
   const creator = readPubkey(buf, o); o += 32;
+
+  // Creator-approved hash of mint, creator, name, symbol, and metadata URI.
+  const metadataCommitment = Buffer.from(buf.subarray(o, o + 32)).toString("hex"); o += 32;
 
   const saleVault = readPubkey(buf, o); o += 32;
   const lpVault = readPubkey(buf, o); o += 32;
@@ -923,12 +938,14 @@ function decodeLaunchState(buf) {
   const lastPoolSwitchTs = readI64(buf, o); o += 8;
   const switchStartedAt = readI64(buf, o); o += 8;
   const switchFeeEscrowedLamports = readU64(buf, o); o += 8;
+  const switchAmountIn = readU64(buf, o); o += 8;
+  const switchMinAmountOut = readU64(buf, o); o += 8;
   const switchSwapExecuted = Boolean(readU8(buf, o)); o += 1;
 
   const lastTradeTs = readI64(buf, o); o += 8;
   const metadata = readPubkey(buf, o); o += 32;
 
-  if (stateU8 > 3 || quoteAssetU8 > 1 || saleSupply <= 0n || saleSupply > TOTAL_SUPPLY_BASE) {
+  if (stateU8 > 4 || quoteAssetU8 > 1 || saleSupply <= 0n || saleSupply > TOTAL_SUPPLY_BASE) {
     return null;
   }
 
@@ -943,6 +960,7 @@ function decodeLaunchState(buf) {
 
     mint,
     creator,
+    metadataCommitment,
 
     platform: null,
     coreAuthority: null,
@@ -973,6 +991,8 @@ function decodeLaunchState(buf) {
     lastPoolSwitchTs,
     switchStartedAt,
     switchFeeEscrowedLamports,
+    switchAmountIn,
+    switchMinAmountOut,
     switchSwapExecuted,
 
     feeTotalBps: TRADE_FEE_BPS,
@@ -1499,6 +1519,8 @@ function isLaunchLikeEvent(name) {
     "MigratedEvent",
     "PoolSwitchStartedEvent",
     "PoolSwitchCompletedEvent",
+    "PoolSwitchCancelledEvent",
+    "ClaimFeesEvent",
     "CreatedTxn",
   ].includes(String(name));
 }
@@ -2452,8 +2474,18 @@ async function startIndexer({ io = null } = {}) {
   console.log("Starting Moonz indexer");
   console.log("Program:", PROGRAM_ID);
   console.log("Live Redis:", ENABLE_LIVE_REDIS ? `${REDIS_URL} / ${LIVE_EVENT_CHANNEL}` : "disabled");
-  console.log("RPC:", RPC_URL);
-  console.log("WS:", HELIUS_WSS.replace(/api-key=.*/, "api-key=***"));
+  const maskedRpcUrl = RPC_URL.replace(
+    /([?&]api-key=)[^&]+/i,
+    "$1***"
+  );
+
+  const maskedWssUrl = HELIUS_WSS.replace(
+    /([?&]api-key=)[^&]+/i,
+    "$1***"
+  );
+
+  console.log("RPC:", maskedRpcUrl);
+  console.log("WS:", maskedWssUrl);
   console.log(`Curve constants: V_SOL=${Number(V_SOL_LAMPORTS) / LAMPORTS_PER_SOL}, V_TOK=${Number(V_TOK_BASE) / TOKEN_SCALE}`);
 
   const priceTimer = startSolPricePoller(io);
