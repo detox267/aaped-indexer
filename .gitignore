@@ -1,0 +1,21 @@
+
+# Production secrets
+.env
+.env.*
+!.env.example
+
+# Runtime databases
+tokens.db
+tokens.db-shm
+tokens.db-wal
+tokens-mainnet.db
+tokens-mainnet.db-shm
+tokens-mainnet.db-wal
+tokens-mainnet*.db
+
+# Runtime media cache
+media-cache/
+
+# Local backups
+*.before-*
+*.bak-before-*
