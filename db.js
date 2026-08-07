@@ -380,6 +380,11 @@ CREATE TABLE IF NOT EXISTS token_stats (
   tokens_remaining TEXT,
   bonding_progress REAL,
 
+  sol_collected TEXT,
+  sol_collected_lamports TEXT,
+  liquidity_sol REAL DEFAULT 0,
+  liquidity_usd REAL DEFAULT 0,
+
   sale_vault TEXT,
   lp_vault TEXT,
   treasury_wsol_vault TEXT,
@@ -452,6 +457,10 @@ function ensureColumn(table, column, definition) {
   }
 }
 
+ensureColumn("token_stats", "sol_collected", "TEXT");
+ensureColumn("token_stats", "sol_collected_lamports", "TEXT");
+ensureColumn("token_stats", "liquidity_sol", "REAL DEFAULT 0");
+ensureColumn("token_stats", "liquidity_usd", "REAL DEFAULT 0");
 ensureColumn("token_stats", "holders_count", "INTEGER DEFAULT 0");
 ensureColumn("token_stats", "price_change_24h_percent", "REAL DEFAULT 0");
 ensureColumn("token_stats", "price_change_24h_usd", "REAL DEFAULT 0");
