@@ -457,6 +457,11 @@ function compactStats(stats = {}) {
     image: stats.image || stats.launch_image || null,
     metadata_uri: stats.metadata_uri || stats.launch_metadata_uri || null,
 
+    extensions_json: stats.extensions_json || null,
+    website: stats.website || null,
+    twitter: stats.twitter || null,
+    telegram: stats.telegram || null,
+
     creator: stats.creator || null,
 
     phase: stats.phase,
@@ -618,6 +623,29 @@ function compactCandle(candle = {}, interval = "15m") {
   };
 }
 
+function parseLaunchMetadataJsonObject(value) {
+  if (!value) return {};
+
+  if (
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    return value;
+  }
+
+  try {
+    const parsed = JSON.parse(String(value));
+
+    return parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 async function fetchLaunchMetadataFromApi(mint) {
   if (!mint || !LAUNCH_API_BASE) return null;
 
@@ -632,14 +660,101 @@ async function fetchLaunchMetadataFromApi(mint) {
     const json = await res.json().catch(() => null);
     if (!json) return null;
 
+    const archived = parseLaunchMetadataJsonObject(
+      json.archived_metadata_json ||
+      json.archivedMetadataJson
+    );
+
+    const extensionsSource =
+      json.extensions_json ||
+      json.extensionsJson ||
+      archived.extensions_json ||
+      archived.extensionsJson ||
+      null;
+
+    const extensions =
+      parseLaunchMetadataJsonObject(
+        extensionsSource
+      );
+
+    const extensionsJson =
+      typeof extensionsSource === "string"
+        ? extensionsSource
+        : extensionsSource
+          ? JSON.stringify(extensionsSource)
+          : null;
+
     return {
-      name: json.name || null,
-      symbol: json.symbol || null,
-      description: json.description || null,
-      image: json.image || null,
-      metadata_uri: json.metadata_uri || json.metadataUri || null,
-      pinata_cid: json.pinata_cid || json.pinataCid || null,
-      creator: json.creator || json.depositor || null,
+      name:
+        json.name ||
+        archived.name ||
+        null,
+
+      symbol:
+        json.symbol ||
+        archived.symbol ||
+        null,
+
+      description:
+        json.description ||
+        archived.description ||
+        null,
+
+      image:
+        json.image ||
+        archived.image ||
+        null,
+
+      metadata_uri:
+        json.metadata_uri ||
+        json.metadataUri ||
+        null,
+
+      pinata_cid:
+        json.pinata_cid ||
+        json.pinataCid ||
+        archived.pinata_cid ||
+        null,
+
+      extensions_json:
+        extensionsJson,
+
+      website:
+        json.website ||
+        archived.website ||
+        extensions.website ||
+        extensions.websiteUrl ||
+        extensions.website_url ||
+        null,
+
+      twitter:
+        json.twitter ||
+        json.x ||
+        archived.twitter ||
+        extensions.twitter ||
+        extensions.x ||
+        extensions.twitterUrl ||
+        extensions.twitter_url ||
+        extensions.xUrl ||
+        extensions.x_url ||
+        null,
+
+      telegram:
+        json.telegram ||
+        json.tg ||
+        archived.telegram ||
+        extensions.telegram ||
+        extensions.tg ||
+        extensions.telegramUrl ||
+        extensions.telegram_url ||
+        extensions.tgUrl ||
+        extensions.tg_url ||
+        null,
+
+      creator:
+        json.creator ||
+        json.depositor ||
+        null,
     };
   } catch (err) {
     console.warn(`metadata fetch failed for ${mint}:`, err?.message || err);
@@ -1193,6 +1308,10 @@ async function refreshMintState(mint, io = null) {
     image: launchMeta?.image || undefined,
     metadata_uri: launchMeta?.metadata_uri || undefined,
     pinata_cid: launchMeta?.pinata_cid || undefined,
+    extensions_json: launchMeta?.extensions_json || undefined,
+    website: launchMeta?.website || undefined,
+    twitter: launchMeta?.twitter || undefined,
+    telegram: launchMeta?.telegram || undefined,
     escrow_sol_vault: state.escrowSolVault || pdas.escrowSolVault,
     sale_vault: state.saleVault || pdas.saleVault,
     lp_vault: state.lpVault || pdas.lpVault,

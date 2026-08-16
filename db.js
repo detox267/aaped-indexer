@@ -258,6 +258,10 @@ CREATE TABLE IF NOT EXISTS launches (
   image TEXT,
   metadata_uri TEXT,
   pinata_cid TEXT,
+  extensions_json TEXT,
+  website TEXT,
+  twitter TEXT,
+  telegram TEXT,
 
   total_supply TEXT,
   sale_supply TEXT,
@@ -466,6 +470,11 @@ ensureColumn("token_stats", "price_change_24h_percent", "REAL DEFAULT 0");
 ensureColumn("token_stats", "price_change_24h_usd", "REAL DEFAULT 0");
 ensureColumn("token_stats", "price_24h_ago_usd", "REAL");
 ensureColumn("token_stats", "price_24h_ago_sol", "REAL");
+
+ensureColumn("launches", "extensions_json", "TEXT");
+ensureColumn("launches", "website", "TEXT");
+ensureColumn("launches", "twitter", "TEXT");
+ensureColumn("launches", "telegram", "TEXT");
 
 function hasSeenTx(sig) {
   return !!db.prepare(`SELECT sig FROM tx_seen WHERE sig = ?`).get(sig);
@@ -1036,6 +1045,10 @@ function getToken(mint) {
       l.image AS launch_image,
       l.metadata_uri AS launch_metadata_uri,
       l.pinata_cid AS launch_pinata_cid,
+      l.extensions_json,
+      l.website,
+      l.twitter,
+      l.telegram,
 
       l.launch_ts AS launch_ts,
       COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
@@ -1063,6 +1076,10 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
         l.image AS launch_image,
         l.metadata_uri AS launch_metadata_uri,
         l.pinata_cid AS launch_pinata_cid,
+        l.extensions_json,
+        l.website,
+        l.twitter,
+        l.telegram,
 
         l.launch_ts AS launch_ts,
         COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
@@ -1087,6 +1104,10 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
       l.image AS launch_image,
       l.metadata_uri AS launch_metadata_uri,
       l.pinata_cid AS launch_pinata_cid,
+      l.extensions_json,
+      l.website,
+      l.twitter,
+      l.telegram,
 
       l.launch_ts AS launch_ts,
       COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
@@ -1257,6 +1278,10 @@ function getCreatorTokens(address) {
       l.image AS launch_image,
       l.metadata_uri AS launch_metadata_uri,
       l.pinata_cid AS launch_pinata_cid,
+      l.extensions_json,
+      l.website,
+      l.twitter,
+      l.telegram,
 
       l.launch_ts AS launch_ts,
       COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) AS created_at
