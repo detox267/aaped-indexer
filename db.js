@@ -1156,7 +1156,11 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
 
     return db.prepare(`
       WITH base AS (
-        SELECT *, (bucket_ts / ?) * ? AS tf_bucket
+        SELECT *,
+          CAST(
+            CAST(bucket_ts / ? AS INTEGER) * ?
+            AS INTEGER
+          ) AS tf_bucket
         FROM candles_1m
         WHERE mint = ?
           AND (? IS NULL OR bucket_ts >= ?)
