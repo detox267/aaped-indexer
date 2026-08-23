@@ -161,6 +161,97 @@ async function getLiveRedisClient() {
   return liveRedisClient;
 }
 
+const liveLaunchPriceUsdCache = new Map();
+
+function getLiveLaunchPriceUsd(mint) {
+  const cleanMint = String(mint || "").trim();
+
+  if (!cleanMint) return null;
+
+  const cached = Number(
+    liveLaunchPriceUsdCache.get(cleanMint)
+  );
+
+  if (Number.isFinite(cached) && cached > 0) {
+    return cached;
+  }
+
+  try {
+    const row = db.prepare(`
+      SELECT
+        COALESCE(open_usd, close_usd) AS launch_price_usd
+      FROM candles_1m
+      WHERE mint = ?
+        AND (
+          (open_usd IS NOT NULL AND open_usd > 0)
+          OR
+          (close_usd IS NOT NULL AND close_usd > 0)
+        )
+      ORDER BY bucket_ts ASC
+      LIMIT 1
+    `).get(cleanMint);
+
+    const launchPriceUsd = Number(
+      row?.launch_price_usd || 0
+    );
+
+    if (
+      Number.isFinite(launchPriceUsd) &&
+      launchPriceUsd > 0
+    ) {
+      liveLaunchPriceUsdCache.set(
+        cleanMint,
+        launchPriceUsd
+      );
+
+      return launchPriceUsd;
+    }
+  } catch (err) {
+    console.warn(
+      "[live-stats] launch price lookup failed:",
+      cleanMint,
+      err?.message || err
+    );
+  }
+
+  // Do not cache a missing value. A brand new token may not
+  // have its first candle yet and should be checked next time.
+  return null;
+}
+
+function withLiveLaunchMetrics(mint, stats) {
+  if (!stats) return stats;
+
+  const launchPriceUsd =
+    getLiveLaunchPriceUsd(mint);
+
+  const currentPriceUsd = Number(
+    stats.price_usd ??
+    stats.priceUsd ??
+    0
+  );
+
+  const change =
+    Number.isFinite(launchPriceUsd) &&
+    launchPriceUsd > 0 &&
+    Number.isFinite(currentPriceUsd) &&
+    currentPriceUsd > 0
+      ? (
+          (currentPriceUsd / launchPriceUsd) - 1
+        ) * 100
+      : null;
+
+  return {
+    ...stats,
+    launch_price_usd:
+      launchPriceUsd ?? null,
+    price_change_since_launch_percent:
+      Number.isFinite(change)
+        ? change
+        : null,
+  };
+}
+
 function liveDedupeKey(event) {
   if (!event?.type || !event?.mint) return null;
 
@@ -206,6 +297,9 @@ function liveDedupeSignature(event) {
     return stringifySafe({
       price_sol: st.price_sol,
       price_usd: st.price_usd,
+      launch_price_usd: st.launch_price_usd,
+      price_change_since_launch_percent:
+        st.price_change_since_launch_percent,
       marketcap_usd: st.marketcap_usd,
       bonding_progress: st.bonding_progress,
       holders_count: st.holders_count,
@@ -353,7 +447,14 @@ function compactLiveEvent(event) {
     return {
       type: event.type,
       mint: event.mint,
-      stats: compactLiveStats(event.stats),
+      stats: {
+        ...compactLiveStats(event.stats),
+        launch_price_usd:
+          event.stats?.launch_price_usd ?? null,
+        price_change_since_launch_percent:
+          event.stats?.price_change_since_launch_percent ??
+          null,
+      },
     };
   }
 
@@ -2130,10 +2231,22 @@ const holdersCount = updateHolderBalancesFromDeltas({
   }
 
   if (stats) {
+    const liveStats = withLiveLaunchMetrics(
+      mint,
+      stats
+    );
+
     publishLiveEvent({
       type: "token.stats.updated",
       mint,
-      stats: compactStats(stats),
+      stats: {
+        ...compactStats(liveStats),
+        launch_price_usd:
+          liveStats?.launch_price_usd ?? null,
+        price_change_since_launch_percent:
+          liveStats?.price_change_since_launch_percent ??
+          null,
+      },
     });
   }
 
