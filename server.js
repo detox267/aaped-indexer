@@ -1331,9 +1331,9 @@ app.get("/debug/db-counts", (req, res) => {
 
 
 // -----------------------------------------------------------------------------
-// King of the Moonz: current-hour top traded tokens
+// Leaderboards: current-hour top traded tokens
 // -----------------------------------------------------------------------------
-function kingParseTime(row = {}) {
+function leaderboardsParseTime(row = {}) {
   const raw =
     row.created_at ??
     row.createdAt ??
@@ -1362,7 +1362,7 @@ function kingParseTime(row = {}) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function kingNum(row = {}, keys = []) {
+function leaderboardsNum(row = {}, keys = []) {
   for (const key of keys) {
     const v = row[key];
     if (v === undefined || v === null || v === "") continue;
@@ -1373,7 +1373,7 @@ function kingNum(row = {}, keys = []) {
 }
 
 
-function kingQuoteAmountUi(row = {}) {
+function leaderboardsQuoteAmountUi(row = {}) {
   const quoteAsset = String(
     row.quote_asset ||
     row.quoteAsset ||
@@ -1381,7 +1381,7 @@ function kingQuoteAmountUi(row = {}) {
     "SOL"
   ).toUpperCase();
 
-  const ui = kingNum(row, [
+  const ui = leaderboardsNum(row, [
     "quote_amount_ui",
     "quoteAmountUi",
     "sol_amount_ui",
@@ -1394,7 +1394,7 @@ function kingQuoteAmountUi(row = {}) {
 
   if (ui > 0) return Math.abs(ui);
 
-  const raw = Math.abs(kingNum(row, [
+  const raw = Math.abs(leaderboardsNum(row, [
     "quote_amount",
     "quoteAmount",
     "sol_amount",
@@ -1602,7 +1602,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
 
     if (!mint) continue;
 
-    const ts = kingParseTime(row);
+    const ts = leaderboardsParseTime(row);
 
     if (
       !ts ||
@@ -1612,7 +1612,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
       continue;
     }
 
-    let volumeUsd = kingNum(row, [
+    let volumeUsd = leaderboardsNum(row, [
       "volume_usd",
       "volumeUsd",
       "amount_usd",
@@ -1625,7 +1625,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
       "usdValue",
     ]);
 
-    const quoteUi = kingQuoteAmountUi(row);
+    const quoteUi = leaderboardsQuoteAmountUi(row);
 
     if (volumeUsd <= 0) {
       const quoteAsset = String(
@@ -1848,32 +1848,6 @@ function getLeaderboardsSnapshot() {
         : "none",
   };
 }
-
-// Legacy compatibility for clients cached before the
-// Leaderboards migration. Remove after the migration window.
-app.get("/api/king-of-moonz", (_req, res) => {
-  try {
-    const snapshot = getLeaderboardsSnapshot();
-
-    res.json({
-      ok: true,
-      ...snapshot,
-      king: snapshot.top_token || null,
-      king_source:
-        snapshot.top_token_source || "none",
-    });
-  } catch (err) {
-    console.error(
-      "[leaderboards-legacy] api failed:",
-      err?.message || err
-    );
-
-    res.status(500).json({
-      ok: false,
-      error: "Failed to load Leaderboards",
-    });
-  }
-});
 
 app.get("/api/leaderboards", (_req, res) => {
   try {

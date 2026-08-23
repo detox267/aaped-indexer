@@ -1730,7 +1730,7 @@ function publicNotification(row) {
 
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS token_king_notifications_sent (
+CREATE TABLE IF NOT EXISTS token_top_token_notifications_sent (
   mint TEXT NOT NULL,
   hour_start INTEGER NOT NULL,
   creator TEXT,
@@ -2125,7 +2125,7 @@ function notifyTokenHitTopTokenOnce({ mint, hour_start = null }) {
   const hourStart = Number(hour_start || Math.floor(Date.now() / 3600000) * 3600000);
 
   const marker = db.prepare(`
-    INSERT OR IGNORE INTO token_king_notifications_sent (
+    INSERT OR IGNORE INTO token_top_token_notifications_sent (
       mint,
       hour_start,
       creator,
@@ -2144,7 +2144,7 @@ function notifyTokenHitTopTokenOnce({ mint, hour_start = null }) {
   createUserNotification({
     recipient_wallet: token.creator,
     actor_wallet: token.creator,
-    type: "token_hit_king",
+    type: "token_hit_top_token",
     title: symbol ? `$${symbol} became Top Token` : "Your token became Top Token",
     body: name ? `${name} won the latest Moonz volume round.` : "Your token won the latest Moonz volume round.",
     mint: token.mint,
@@ -2156,7 +2156,7 @@ function notifyTokenHitTopTokenOnce({ mint, hour_start = null }) {
       token_url: `/token/${token.mint}`,
       creator_url: `/creator/${token.creator}`,
     },
-    unique_key: `token_hit_king:${token.mint}:${hourStart}`,
+    unique_key: `token_hit_top_token:${token.mint}:${hourStart}`,
   });
 
   return { inserted: 1, skipped: false };

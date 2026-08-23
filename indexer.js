@@ -2750,10 +2750,10 @@ module.exports = {
 
 
 // -----------------------------------------------------------------------------
-// King of the Moonz: hourly top traded tokens
+// Leaderboards: hourly top traded tokens
 // -----------------------------------------------------------------------------
 
-function kingQuoteAmountUi(row = {}) {
+function leaderboardsQuoteAmountUi(row = {}) {
   const quoteAsset = String(
     row.quote_asset ||
     row.quoteAsset ||
@@ -2761,7 +2761,7 @@ function kingQuoteAmountUi(row = {}) {
     "SOL"
   ).toUpperCase();
 
-  const ui = kingNum(row, [
+  const ui = leaderboardsNum(row, [
     "quote_amount_ui",
     "quoteAmountUi",
     "sol_amount_ui",
@@ -2774,7 +2774,7 @@ function kingQuoteAmountUi(row = {}) {
 
   if (ui > 0) return Math.abs(ui);
 
-  const raw = Math.abs(kingNum(row, [
+  const raw = Math.abs(leaderboardsNum(row, [
     "quote_amount",
     "quoteAmount",
     "sol_amount",
@@ -2794,7 +2794,7 @@ function kingQuoteAmountUi(row = {}) {
   return raw / 1_000_000_000;
 }
 
-function kingParseTime(row = {}) {
+function leaderboardsParseTime(row = {}) {
   const raw =
     row.created_at ??
     row.createdAt ??
@@ -2823,7 +2823,7 @@ function kingParseTime(row = {}) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function kingNum(row = {}, keys = []) {
+function leaderboardsNum(row = {}, keys = []) {
   for (const key of keys) {
     const v = row[key];
     if (v === undefined || v === null || v === "") continue;
@@ -3021,7 +3021,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
 
     if (!mint) continue;
 
-    const ts = kingParseTime(row);
+    const ts = leaderboardsParseTime(row);
 
     if (
       !ts ||
@@ -3031,7 +3031,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
       continue;
     }
 
-    let volumeUsd = kingNum(row, [
+    let volumeUsd = leaderboardsNum(row, [
       "volume_usd",
       "volumeUsd",
       "amount_usd",
@@ -3044,7 +3044,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
       "usdValue",
     ]);
 
-    const quoteUi = kingQuoteAmountUi(row);
+    const quoteUi = leaderboardsQuoteAmountUi(row);
 
     if (volumeUsd <= 0) {
       const quoteAsset = String(
@@ -3281,19 +3281,19 @@ function publishLeaderboardsSnapshot(reason = "tick") {
         snapshot?.top_token_source === "completed_round" &&
         snapshot?.top_token?.mint
       ) {
-        const kingNotifyResult = notifyTokenHitTopTokenOnce({
+        const leaderboardsNotifyResult = notifyTokenHitTopTokenOnce({
           mint: snapshot.top_token.mint,
           hour_start:
             snapshot.top_token.round_start ||
             snapshot.hour_start - 3600000,
         });
 
-        if (!kingNotifyResult.skipped) {
+        if (!leaderboardsNotifyResult.skipped) {
           console.log(`[notifications] Top Token notification sent for ${snapshot.top_token.mint}`);
         }
       }
     } catch (err) {
-      console.warn("[notifications] King notify failed:", err?.message || err);
+      console.warn("[notifications] Top Token notify failed:", err?.message || err);
     }
 
 
