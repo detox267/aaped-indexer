@@ -2115,7 +2115,7 @@ function notifyWalletFollowed({ follower, following }) {
   return { inserted: after > before ? 1 : 0, skipped: after <= before };
 }
 
-function notifyTokenHitKingOnce({ mint, hour_start = null }) {
+function notifyTokenHitTopTokenOnce({ mint, hour_start = null }) {
   const token = getTokenNotificationMeta(mint);
 
   if (!token?.mint || !token?.creator) {
@@ -2470,7 +2470,7 @@ module.exports = {
   createUserNotification,
   createNotificationsForFollowers,
   notifyTokenMigratedAmmOnce,
-  notifyTokenHitKingOnce,
+  notifyTokenHitTopTokenOnce,
   notifyWalletFollowed,
   listUserNotifications,
   getUnreadNotificationCount,

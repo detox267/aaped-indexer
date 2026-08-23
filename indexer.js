@@ -15,7 +15,7 @@ const {
   getPrice,
   upsertLaunch,
   notifyTokenMigratedAmmOnce,
-  notifyTokenHitKingOnce,
+  notifyTokenHitTopTokenOnce,
   notifyFollowersOnceOfCreatorLaunch,
   upsertTokenStats,
   insertEvent,
@@ -2309,9 +2309,9 @@ const holdersCount = updateHolderBalancesFromDeltas({
       },
     });
 
-    if (typeof publishKingOfMoonzSnapshot === "function") {
+    if (typeof publishLeaderboardsSnapshot === "function") {
       setTimeout(() => {
-        publishKingOfMoonzSnapshot("trade");
+        publishLeaderboardsSnapshot("trade");
       }, 0);
     }
   }
@@ -2833,7 +2833,7 @@ function kingNum(row = {}, keys = []) {
   return 0;
 }
 
-function kingTokenMeta(mint) {
+function topTokenMeta(mint) {
   if (!mint) return {};
 
   try {
@@ -2902,7 +2902,7 @@ function getPersistedTopToken() {
 
     if (!state?.mint) return null;
 
-    const meta = kingTokenMeta(state.mint);
+    const meta = topTokenMeta(state.mint);
 
     return {
       rank: 1,
@@ -3108,7 +3108,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
     })
     .slice(0, 10)
     .map((item, index) => {
-      const meta = kingTokenMeta(item.mint);
+      const meta = topTokenMeta(item.mint);
 
       return {
         rank: index + 1,
@@ -3165,7 +3165,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
     });
 }
 
-function getKingOfMoonzSnapshot() {
+function getLeaderboardsSnapshot() {
   const now = Date.now();
 
   const hourStart = new Date(now);
@@ -3199,8 +3199,8 @@ function getKingOfMoonzSnapshot() {
       hour_end: hourEndMs,
       top10: [],
       top3: [],
-      king: persisted,
-      king_source: persisted
+      top_token: persisted,
+      top_token_source: persisted
         ? "completed_round"
         : "none",
     };
@@ -3252,15 +3252,15 @@ function getKingOfMoonzSnapshot() {
     ? top10[0] || null
     : null;
 
-  const king = persisted || bootstrap || null;
+  const topToken = persisted || bootstrap || null;
 
   return {
     hour_start: hourStartMs,
     hour_end: hourEndMs,
     top10,
     top3: top10.slice(0, 3),
-    king,
-    king_source: persisted
+    top_token: topToken,
+    top_token_source: persisted
       ? "completed_round"
       : bootstrap
         ? "bootstrap_current"
@@ -3268,28 +3268,28 @@ function getKingOfMoonzSnapshot() {
   };
 }
 
-let __lastKingPayload = "";
+let __lastLeaderboardsPayload = "";
 
-function publishKingOfMoonzSnapshot(reason = "tick") {
+function publishLeaderboardsSnapshot(reason = "tick") {
   try {
     if (typeof publishLiveEvent !== "function") return;
 
-    const snapshot = getKingOfMoonzSnapshot();
+    const snapshot = getLeaderboardsSnapshot();
 
     try {
       if (
-        snapshot?.king_source === "completed_round" &&
-        snapshot?.king?.mint
+        snapshot?.top_token_source === "completed_round" &&
+        snapshot?.top_token?.mint
       ) {
-        const kingNotifyResult = notifyTokenHitKingOnce({
-          mint: snapshot.king.mint,
+        const kingNotifyResult = notifyTokenHitTopTokenOnce({
+          mint: snapshot.top_token.mint,
           hour_start:
-            snapshot.king.round_start ||
+            snapshot.top_token.round_start ||
             snapshot.hour_start - 3600000,
         });
 
         if (!kingNotifyResult.skipped) {
-          console.log(`[notifications] King notification sent for ${snapshot.king.mint}`);
+          console.log(`[notifications] Top Token notification sent for ${snapshot.top_token.mint}`);
         }
       }
     } catch (err) {
@@ -3299,33 +3299,33 @@ function publishKingOfMoonzSnapshot(reason = "tick") {
 
 
     const compact = JSON.stringify({
-      king: snapshot.king?.mint || null,
+      top_token: snapshot.top_token?.mint || null,
       top3: snapshot.top3.map((x) => `${x.mint}:${Math.round(x.hour_volume_usd)}`),
       hour_start: snapshot.hour_start,
     });
 
-    if (compact === __lastKingPayload && reason !== "force") return;
-    __lastKingPayload = compact;
+    if (compact === __lastLeaderboardsPayload && reason !== "force") return;
+    __lastLeaderboardsPayload = compact;
 
     publishLiveEvent({
-      type: "king.moonz.updated",
+      type: "leaderboards.updated",
       reason,
       ...snapshot,
     });
   } catch (err) {
-    console.error("[king] publish failed:", err?.message || err);
+    console.error("[topToken] publish failed:", err?.message || err);
   }
 }
 
-if (!global.__kingOfMoonzIntervalMounted) {
-  global.__kingOfMoonzIntervalMounted = true;
+if (!global.__leaderboardsIntervalMounted) {
+  global.__leaderboardsIntervalMounted = true;
 
   setInterval(() => {
-    publishKingOfMoonzSnapshot("tick");
+    publishLeaderboardsSnapshot("tick");
   }, 10000);
 
   setTimeout(() => {
-    publishKingOfMoonzSnapshot("startup");
+    publishLeaderboardsSnapshot("startup");
   }, 3000);
 }
 

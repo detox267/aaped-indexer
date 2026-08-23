@@ -1414,7 +1414,7 @@ function kingQuoteAmountUi(row = {}) {
   return raw / 1_000_000_000;
 }
 
-function getKingTokenMeta(mint) {
+function getTopTokenMeta(mint) {
   if (!mint) return {};
 
   try {
@@ -1483,7 +1483,7 @@ function getPersistedTopToken() {
 
     if (!state?.mint) return null;
 
-    const meta = getKingTokenMeta(state.mint);
+    const meta = getTopTokenMeta(state.mint);
 
     return {
       rank: 1,
@@ -1689,7 +1689,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
     })
     .slice(0, 10)
     .map((item, index) => {
-      const meta = getKingTokenMeta(item.mint);
+      const meta = getTopTokenMeta(item.mint);
 
       return {
         rank: index + 1,
@@ -1746,7 +1746,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
     });
 }
 
-function getKingOfMoonzSnapshot() {
+function getLeaderboardsSnapshot() {
   const now = Date.now();
 
   const hourStart = new Date(now);
@@ -1780,8 +1780,8 @@ function getKingOfMoonzSnapshot() {
       hour_end: hourEndMs,
       top10: [],
       top3: [],
-      king: persisted,
-      king_source: persisted
+      top_token: persisted,
+      top_token_source: persisted
         ? "completed_round"
         : "none",
     };
@@ -1833,15 +1833,15 @@ function getKingOfMoonzSnapshot() {
     ? top10[0] || null
     : null;
 
-  const king = persisted || bootstrap || null;
+  const topToken = persisted || bootstrap || null;
 
   return {
     hour_start: hourStartMs,
     hour_end: hourEndMs,
     top10,
     top3: top10.slice(0, 3),
-    king,
-    king_source: persisted
+    top_token: topToken,
+    top_token_source: persisted
       ? "completed_round"
       : bootstrap
         ? "bootstrap_current"
@@ -1849,14 +1849,40 @@ function getKingOfMoonzSnapshot() {
   };
 }
 
+// Legacy compatibility for clients cached before the
+// Leaderboards migration. Remove after the migration window.
 app.get("/api/king-of-moonz", (_req, res) => {
+  try {
+    const snapshot = getLeaderboardsSnapshot();
+
+    res.json({
+      ok: true,
+      ...snapshot,
+      king: snapshot.top_token || null,
+      king_source:
+        snapshot.top_token_source || "none",
+    });
+  } catch (err) {
+    console.error(
+      "[leaderboards-legacy] api failed:",
+      err?.message || err
+    );
+
+    res.status(500).json({
+      ok: false,
+      error: "Failed to load Leaderboards",
+    });
+  }
+});
+
+app.get("/api/leaderboards", (_req, res) => {
   try {
     res.json({
       ok: true,
-      ...getKingOfMoonzSnapshot(),
+      ...getLeaderboardsSnapshot(),
     });
   } catch (err) {
-    console.error("[king] api failed:", err?.message || err);
+    console.error("[leaderboards] api failed:", err?.message || err);
     res.status(500).json({
       ok: false,
       error: "Failed to load Top Token",
