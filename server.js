@@ -1430,42 +1430,137 @@ function getKingTokenMeta(mint) {
   }
 }
 
-function getKingOfMoonzSnapshot() {
-  const now = Date.now();
-  const hourStart = new Date(now);
-  hourStart.setMinutes(0, 0, 0);
+function getPersistedTopToken() {
+  try {
+    const state = db.prepare(`
+      SELECT *
+      FROM top_token_state
+      WHERE id = 1
+      LIMIT 1
+    `).get();
 
-  const hourStartMs = hourStart.getTime();
-  const hourEndMs = hourStartMs + 3600000;
+    if (!state?.mint) return null;
 
-  let rows = [];
+    const meta = getKingTokenMeta(state.mint);
+
+    return {
+      rank: 1,
+      mint: state.mint,
+      name:
+        meta.name ||
+        meta.launch_name ||
+        meta.token_name ||
+        "Unknown Token",
+      symbol:
+        meta.symbol ||
+        meta.launch_symbol ||
+        meta.token_symbol ||
+        "",
+      image:
+        meta.image ||
+        meta.launch_image ||
+        meta.token_image ||
+        "",
+      price_usd: Number(meta.price_usd || meta.priceUsd || 0),
+      marketcap_usd: Number(
+        meta.marketcap_usd ||
+        meta.marketCapUsd ||
+        0
+      ),
+      price_change_24h_percent: Number(
+        meta.price_change_24h_percent ||
+        meta.priceChange24hPercent ||
+        0
+      ),
+      hour_volume_usd: Number(state.round_volume_usd || 0),
+      hour_volume_quote: Number(state.round_volume_quote || 0),
+      trades_count: Number(state.trades_count || 0),
+      buys_count: Number(state.buys_count || 0),
+      sells_count: Number(state.sells_count || 0),
+      last_trade_at: Number(state.last_trade_at || 0),
+      round_start: Number(state.round_start || 0),
+      round_end: Number(state.round_end || 0),
+      persisted: true,
+    };
+  } catch (err) {
+    console.warn("[top-token] persisted read failed:", err?.message || err);
+    return null;
+  }
+}
+
+function persistTopToken(token, roundStart, roundEnd) {
+  if (!token?.mint) return false;
 
   try {
-    rows = db.prepare(`
-      SELECT *
-      FROM trades
-      ORDER BY rowid DESC
-      LIMIT 20000
-    `).all();
-  } catch (err) {
-    console.error("[king] trades read failed:", err?.message || err);
-    return {
-      hour_start: hourStartMs,
-      hour_end: hourEndMs,
-      top10: [],
-      top3: [],
-      king: null,
-    };
-  }
+    db.prepare(`
+      INSERT INTO top_token_state (
+        id,
+        mint,
+        round_start,
+        round_end,
+        round_volume_usd,
+        round_volume_quote,
+        trades_count,
+        buys_count,
+        sells_count,
+        last_trade_at,
+        updated_at
+      )
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id)
+      DO UPDATE SET
+        mint = excluded.mint,
+        round_start = excluded.round_start,
+        round_end = excluded.round_end,
+        round_volume_usd = excluded.round_volume_usd,
+        round_volume_quote = excluded.round_volume_quote,
+        trades_count = excluded.trades_count,
+        buys_count = excluded.buys_count,
+        sells_count = excluded.sells_count,
+        last_trade_at = excluded.last_trade_at,
+        updated_at = excluded.updated_at
+    `).run(
+      String(token.mint),
+      Number(roundStart),
+      Number(roundEnd),
+      Number(token.hour_volume_usd || 0),
+      Number(token.hour_volume_quote || 0),
+      Number(token.trades_count || 0),
+      Number(token.buys_count || 0),
+      Number(token.sells_count || 0),
+      Number(token.last_trade_at || 0),
+      Math.floor(Date.now() / 1000)
+    );
 
+    return true;
+  } catch (err) {
+    console.warn("[top-token] persisted write failed:", err?.message || err);
+    return false;
+  }
+}
+
+function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
   const byMint = new Map();
 
   for (const row of rows) {
-    const mint = String(row.mint || row.token_mint || row.tokenMint || "").trim();
+    const mint = String(
+      row.mint ||
+      row.token_mint ||
+      row.tokenMint ||
+      ""
+    ).trim();
+
     if (!mint) continue;
 
     const ts = kingParseTime(row);
-    if (!ts || ts < hourStartMs || ts >= hourEndMs) continue;
+
+    if (
+      !ts ||
+      ts < roundStartMs ||
+      ts >= roundEndMs
+    ) {
+      continue;
+    }
 
     let volumeUsd = kingNum(row, [
       "volume_usd",
@@ -1482,7 +1577,6 @@ function getKingOfMoonzSnapshot() {
 
     const quoteUi = kingQuoteAmountUi(row);
 
-    // Fallback if trade rows do not store USD volume.
     if (volumeUsd <= 0) {
       const quoteAsset = String(
         row.quote_asset ||
@@ -1494,16 +1588,17 @@ function getKingOfMoonzSnapshot() {
       if (quoteAsset === "USDC") {
         volumeUsd = quoteUi;
       } else {
-        const solUsd =
-          typeof getPrice === "function"
-            ? Number(getPrice("SOL_USD")?.price || 0)
-            : 0;
-
         volumeUsd = solUsd > 0 ? quoteUi * solUsd : quoteUi;
       }
+
     }
 
-    const side = String(row.side || row.trade_side || row.type || "").toLowerCase();
+    const side = String(
+      row.side ||
+      row.trade_side ||
+      row.type ||
+      ""
+    ).toLowerCase();
 
     const prev = byMint.get(mint) || {
       mint,
@@ -1522,11 +1617,15 @@ function getKingOfMoonzSnapshot() {
     if (side.includes("buy")) prev.buys_count += 1;
     if (side.includes("sell")) prev.sells_count += 1;
 
-    prev.last_trade_at = Math.max(prev.last_trade_at || 0, ts);
+    prev.last_trade_at = Math.max(
+      prev.last_trade_at || 0,
+      ts
+    );
+
     byMint.set(mint, prev);
   }
 
-  const top10 = [...byMint.values()]
+  return [...byMint.values()]
     .sort((a, b) => {
       if (b.hour_volume_usd !== a.hour_volume_usd) {
         return b.hour_volume_usd - a.hour_volume_usd;
@@ -1545,26 +1644,150 @@ function getKingOfMoonzSnapshot() {
       return {
         rank: index + 1,
         mint: item.mint,
-        name: meta.name || meta.launch_name || meta.token_name || "Unknown Token",
-        symbol: meta.symbol || meta.launch_symbol || meta.token_symbol || "",
-        image: meta.image || meta.launch_image || meta.token_image || "",
-        price_usd: Number(meta.price_usd || meta.priceUsd || 0),
-        marketcap_usd: Number(meta.marketcap_usd || meta.marketCapUsd || 0),
-        hour_volume_usd: Number(item.hour_volume_usd || 0),
-        hour_volume_quote: Number(item.hour_volume_quote || 0),
+        name:
+          meta.name ||
+          meta.launch_name ||
+          meta.token_name ||
+          "Unknown Token",
+        symbol:
+          meta.symbol ||
+          meta.launch_symbol ||
+          meta.token_symbol ||
+          "",
+        image:
+          meta.image ||
+          meta.launch_image ||
+          meta.token_image ||
+          "",
+        price_usd: Number(
+          meta.price_usd ||
+          meta.priceUsd ||
+          0
+        ),
+        marketcap_usd: Number(
+          meta.marketcap_usd ||
+          meta.marketCapUsd ||
+          0
+        ),
+        price_change_24h_percent: Number(
+          meta.price_change_24h_percent ||
+          meta.priceChange24hPercent ||
+          0
+        ),
+        hour_volume_usd: Number(
+          item.hour_volume_usd || 0
+        ),
+        hour_volume_quote: Number(
+          item.hour_volume_quote || 0
+        ),
         trades_count: Number(item.trades_count || 0),
         buys_count: Number(item.buys_count || 0),
         sells_count: Number(item.sells_count || 0),
         last_trade_at: item.last_trade_at || 0,
       };
     });
+}
+
+function getKingOfMoonzSnapshot() {
+  const now = Date.now();
+
+  const hourStart = new Date(now);
+  hourStart.setMinutes(0, 0, 0);
+
+  const hourStartMs = hourStart.getTime();
+  const hourEndMs = hourStartMs + 3600000;
+
+  const previousStartMs = hourStartMs - 3600000;
+  const previousEndMs = hourStartMs;
+
+  let rows = [];
+
+  try {
+    rows = db.prepare(`
+      SELECT *
+      FROM trades
+      ORDER BY rowid DESC
+      LIMIT 20000
+    `).all();
+  } catch (err) {
+    console.error(
+      "[top-token] trades read failed:",
+      err?.message || err
+    );
+
+    const persisted = getPersistedTopToken();
+
+    return {
+      hour_start: hourStartMs,
+      hour_end: hourEndMs,
+      top10: [],
+      top3: [],
+      king: persisted,
+      king_source: persisted
+        ? "completed_round"
+        : "none",
+    };
+  }
+
+  const solUsd =
+    typeof getPrice === "function"
+      ? Number(getPrice("SOL_USD")?.price || 0)
+      : 0;
+
+  // Current hour remains the live ranking.
+  const top10 = buildKingRound(
+    rows,
+    hourStartMs,
+    hourEndMs,
+    solUsd
+  );
+
+  // The featured Top Token comes from the completed hour.
+  const previousTop10 = buildKingRound(
+    rows,
+    previousStartMs,
+    previousEndMs,
+    solUsd
+  );
+
+  const previousWinner = previousTop10[0] || null;
+  const storedBefore = getPersistedTopToken();
+
+  // Only advance persistent state once a completed round
+  // actually has a valid winner.
+  if (
+    previousWinner?.mint &&
+    Number(storedBefore?.round_start || 0) < previousStartMs
+  ) {
+    persistTopToken(
+      previousWinner,
+      previousStartMs,
+      previousEndMs
+    );
+  }
+
+  const persisted = getPersistedTopToken();
+
+  // Bootstrap only: if Moonz has never stored a completed
+  // winner yet, show the current leader rather than a blank card.
+  // It is not persisted until its round actually completes.
+  const bootstrap = !persisted
+    ? top10[0] || null
+    : null;
+
+  const king = persisted || bootstrap || null;
 
   return {
     hour_start: hourStartMs,
     hour_end: hourEndMs,
     top10,
     top3: top10.slice(0, 3),
-    king: top10[0] || null,
+    king,
+    king_source: persisted
+      ? "completed_round"
+      : bootstrap
+        ? "bootstrap_current"
+        : "none",
   };
 }
 
@@ -1578,7 +1801,7 @@ app.get("/api/king-of-moonz", (_req, res) => {
     console.error("[king] api failed:", err?.message || err);
     res.status(500).json({
       ok: false,
-      error: "Failed to load King of the Moonz",
+      error: "Failed to load Top Token",
     });
   }
 });

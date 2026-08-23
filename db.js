@@ -450,6 +450,25 @@ CREATE TABLE IF NOT EXISTS candles_1m (
 CREATE INDEX IF NOT EXISTS candles_1m_mint_ts_idx ON candles_1m(mint, bucket_ts);
 `);
 
+
+// Persistent Top Token winner.
+// One row stores the most recently completed valid volume round.
+db.exec(`
+CREATE TABLE IF NOT EXISTS top_token_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  mint TEXT NOT NULL,
+  round_start INTEGER NOT NULL,
+  round_end INTEGER NOT NULL,
+  round_volume_usd REAL NOT NULL DEFAULT 0,
+  round_volume_quote REAL NOT NULL DEFAULT 0,
+  trades_count INTEGER NOT NULL DEFAULT 0,
+  buys_count INTEGER NOT NULL DEFAULT 0,
+  sells_count INTEGER NOT NULL DEFAULT 0,
+  last_trade_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+`);
+
 function columnExists(table, column) {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all();
   return rows.some((r) => r.name === column);
@@ -2072,8 +2091,8 @@ function notifyTokenHitKingOnce({ mint, hour_start = null }) {
     recipient_wallet: token.creator,
     actor_wallet: token.creator,
     type: "token_hit_king",
-    title: symbol ? `$${symbol} became King of the Moonz` : "Your token became King of the Moonz",
-    body: name ? `${name} is leading hourly Moonz volume.` : "Your token is leading hourly Moonz volume.",
+    title: symbol ? `$${symbol} became Top Token` : "Your token became Top Token",
+    body: name ? `${name} won the latest Moonz volume round.` : "Your token won the latest Moonz volume round.",
     mint: token.mint,
     data: {
       mint: token.mint,
