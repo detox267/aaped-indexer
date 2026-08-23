@@ -3329,3 +3329,18 @@ if (!global.__leaderboardsIntervalMounted) {
   }, 3000);
 }
 
+
+
+// ============================================================================
+// USD_MARK_CANDLES_BOOT_V1
+// Persist USD valuation movement between real Moonz trades.
+// ============================================================================
+const {
+  startUsdMarkCandleWorker,
+} = require("./usd-mark-candles");
+
+startUsdMarkCandleWorker({
+  db,
+  getPrice:
+    require("./db").getPrice,
+});
