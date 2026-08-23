@@ -1048,8 +1048,60 @@ function refresh24hVolume(mint) {
   });
 }
 
+function withLaunchPriceMetrics(token) {
+  if (!token?.mint) return token;
+
+  let first = null;
+
+  try {
+    first = db.prepare(`
+      SELECT
+        COALESCE(open_usd, close_usd) AS launch_price_usd
+      FROM candles_1m
+      WHERE mint = ?
+        AND (
+          (open_usd IS NOT NULL AND open_usd > 0)
+          OR
+          (close_usd IS NOT NULL AND close_usd > 0)
+        )
+      ORDER BY bucket_ts ASC
+      LIMIT 1
+    `).get(token.mint);
+  } catch (_err) {
+    first = null;
+  }
+
+  const launchPriceUsd = Number(
+    first?.launch_price_usd || 0
+  );
+
+  const currentPriceUsd = Number(
+    token.price_usd ??
+    token.priceUsd ??
+    0
+  );
+
+  const change =
+    launchPriceUsd > 0 &&
+    currentPriceUsd > 0
+      ? ((currentPriceUsd / launchPriceUsd) - 1) * 100
+      : null;
+
+  return {
+    ...token,
+    launch_price_usd:
+      launchPriceUsd > 0
+        ? launchPriceUsd
+        : null,
+    price_change_since_launch_percent:
+      Number.isFinite(change)
+        ? change
+        : null,
+  };
+}
+
 function getToken(mint) {
-  return db.prepare(`
+  return withLaunchPriceMetrics(db.prepare(`
     SELECT
       ts.*,
 
@@ -1075,7 +1127,7 @@ function getToken(mint) {
     FROM token_stats ts
     LEFT JOIN launches l ON l.mint = ts.mint
     WHERE ts.mint = ?
-  `).get(mint);
+  `).get(mint));
 }
 
 function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
@@ -1108,7 +1160,8 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
       WHERE ts.phase = ?
       ORDER BY COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) DESC
       LIMIT ? OFFSET ?
-    `).all(phase, cappedLimit, safeOffset);
+    `).all(phase, cappedLimit, safeOffset)
+      .map(withLaunchPriceMetrics);
   }
 
   return db.prepare(`
@@ -1135,7 +1188,8 @@ function listTokens({ limit = 50, offset = 0, phase = null } = {}) {
     LEFT JOIN launches l ON l.mint = ts.mint
     ORDER BY COALESCE(NULLIF(l.launch_ts, 0), l.created_at, ts.updated_at) DESC
     LIMIT ? OFFSET ?
-  `).all(cappedLimit, safeOffset);
+  `).all(cappedLimit, safeOffset)
+    .map(withLaunchPriceMetrics);
 }
 
 function getTrades({ mint = null, limit = 50, offset = 0 } = {}) {

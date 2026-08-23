@@ -2724,13 +2724,55 @@ function kingTokenMeta(mint) {
   if (!mint) return {};
 
   try {
-    return db.prepare(`
+    const meta = db.prepare(`
       SELECT *
       FROM token_stats
       WHERE mint = ?
       ORDER BY updated_at DESC
       LIMIT 1
     `).get(mint) || {};
+
+    const first = db.prepare(`
+      SELECT
+        COALESCE(open_usd, close_usd) AS launch_price_usd
+      FROM candles_1m
+      WHERE mint = ?
+        AND (
+          (open_usd IS NOT NULL AND open_usd > 0)
+          OR
+          (close_usd IS NOT NULL AND close_usd > 0)
+        )
+      ORDER BY bucket_ts ASC
+      LIMIT 1
+    `).get(mint);
+
+    const launchPriceUsd = Number(
+      first?.launch_price_usd || 0
+    );
+
+    const currentPriceUsd = Number(
+      meta.price_usd ||
+      meta.priceUsd ||
+      0
+    );
+
+    const change =
+      launchPriceUsd > 0 &&
+      currentPriceUsd > 0
+        ? ((currentPriceUsd / launchPriceUsd) - 1) * 100
+        : null;
+
+    return {
+      ...meta,
+      launch_price_usd:
+        launchPriceUsd > 0
+          ? launchPriceUsd
+          : null,
+      price_change_since_launch_percent:
+        Number.isFinite(change)
+          ? change
+          : null,
+    };
   } catch (_err) {
     return {};
   }
@@ -2778,6 +2820,14 @@ function getPersistedTopToken() {
         meta.priceChange24hPercent ||
         0
       ),
+      launch_price_usd:
+        meta.launch_price_usd != null
+          ? Number(meta.launch_price_usd)
+          : null,
+      price_change_since_launch_percent:
+        meta.price_change_since_launch_percent != null
+          ? Number(meta.price_change_since_launch_percent)
+          : null,
       hour_volume_usd: Number(state.round_volume_usd || 0),
       hour_volume_quote: Number(state.round_volume_quote || 0),
       trades_count: Number(state.trades_count || 0),
@@ -2980,6 +3030,14 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
           meta.priceChange24hPercent ||
           0
         ),
+        launch_price_usd:
+          meta.launch_price_usd != null
+            ? Number(meta.launch_price_usd)
+            : null,
+        price_change_since_launch_percent:
+          meta.price_change_since_launch_percent != null
+            ? Number(meta.price_change_since_launch_percent)
+            : null,
         hour_volume_usd: Number(
           item.hour_volume_usd || 0
         ),
