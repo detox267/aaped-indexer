@@ -1960,7 +1960,7 @@ app.use((err, req, res, next) => {
 
   const PORT = Number(process.env.PORT || process.env.WS_PORT || 3010);
 
-  server.listen(PORT, () => {
+  server.listen(PORT, "127.0.0.1", () => {
     console.log(`Moonz indexer HTTP+Socket server listening on :${PORT}`);
   });
 })().catch((err) => {
