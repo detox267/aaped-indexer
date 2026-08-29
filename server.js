@@ -1331,6 +1331,18 @@ app.get("/debug/db-counts", (req, res) => {
 
 
 // -----------------------------------------------------------------------------
+// Homepage snapshot
+// -----------------------------------------------------------------------------
+
+const HOMEPAGE_SNAPSHOT_INTERVAL_MS = Math.max(
+  5000,
+  Number(process.env.HOMEPAGE_SNAPSHOT_INTERVAL_MS || 10_000)
+);
+
+let homepageSnapshot = null;
+let homepageSnapshotLastError = null;
+
+// -----------------------------------------------------------------------------
 // Leaderboards: current-hour top traded tokens
 // -----------------------------------------------------------------------------
 function leaderboardsParseTime(row = {}) {
@@ -1849,6 +1861,114 @@ function getLeaderboardsSnapshot() {
   };
 }
 
+function buildHomepageSnapshot(reason = "tick") {
+  const generatedAt = Date.now();
+
+  const tokens = listTokens({
+    limit: 100,
+    offset: 0,
+    phase: null,
+  });
+
+  const trades = getTradesWithTokenMeta({
+    limit: 100,
+    offset: 0,
+  });
+
+  const leaderboards = getLeaderboardsSnapshot();
+  const topTokenMint =
+    leaderboards?.top_token?.mint ||
+    null;
+
+  const topTokenCandles = topTokenMint
+    ? getCandles({
+        mint: topTokenMint,
+        interval: "15m",
+        limit: 32,
+        since: null,
+      })
+    : [];
+
+  return {
+    ok: true,
+    tokens: Array.isArray(tokens) ? tokens : [],
+    trades: Array.isArray(trades) ? trades : [],
+    leaderboards,
+    top_token_candles: Array.isArray(topTokenCandles)
+      ? topTokenCandles
+      : [],
+    generated_at: generatedAt,
+    reason,
+  };
+}
+
+function refreshHomepageSnapshot(reason = "tick") {
+  try {
+    const next = buildHomepageSnapshot(reason);
+
+    homepageSnapshot = next;
+    homepageSnapshotLastError = null;
+
+    return next;
+  } catch (err) {
+    homepageSnapshotLastError = {
+      message: err?.message || String(err),
+      failed_at: Date.now(),
+      reason,
+    };
+
+    console.error(
+      "[homepage-snapshot] rebuild failed:",
+      homepageSnapshotLastError.message
+    );
+
+    return homepageSnapshot;
+  }
+}
+
+app.get("/api/homepage", (_req, res) => {
+  try {
+    const snapshot =
+      homepageSnapshot ||
+      refreshHomepageSnapshot("request-bootstrap");
+
+    if (!snapshot) {
+      return res.status(503).json({
+        ok: false,
+        error: "Homepage snapshot unavailable",
+        snapshot_error: homepageSnapshotLastError,
+      });
+    }
+
+    const ageMs = Math.max(
+      0,
+      Date.now() - Number(snapshot.generated_at || 0)
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=1, s-maxage=5, stale-while-revalidate=30"
+    );
+    res.setHeader(
+      "X-Moonz-Snapshot-Age-Ms",
+      String(ageMs)
+    );
+
+    return res.json(snapshot);
+  } catch (err) {
+    console.error(
+      "[homepage-snapshot] request failed:",
+      err?.message || err
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to load homepage snapshot",
+    });
+  }
+});
+
+
 app.get("/api/leaderboards", (_req, res) => {
   try {
     res.json({
@@ -1956,12 +2076,23 @@ app.use((err, req, res, next) => {
 });
 
 (async () => {
+  refreshHomepageSnapshot("startup");
+
+  const homepageSnapshotTimer = setInterval(() => {
+    refreshHomepageSnapshot("tick");
+  }, HOMEPAGE_SNAPSHOT_INTERVAL_MS);
+
+  homepageSnapshotTimer.unref();
+
   await startIndexer({ io });
 
   const PORT = Number(process.env.PORT || process.env.WS_PORT || 3010);
 
   server.listen(PORT, "127.0.0.1", () => {
     console.log(`Moonz indexer HTTP+Socket server listening on :${PORT}`);
+    console.log(
+      `Homepage snapshot refresh: ${HOMEPAGE_SNAPSHOT_INTERVAL_MS}ms`
+    );
   });
 })().catch((err) => {
   console.error("Fatal indexer server error:", err);
