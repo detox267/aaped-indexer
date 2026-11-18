@@ -480,6 +480,9 @@ function ensureColumn(table, column, definition) {
   }
 }
 
+// The HTTP and publisher processes can start against the same older database.
+db.transaction(() => ensureColumn("top_token_state", "fusion_pool_id", "TEXT")).immediate();
+
 ensureColumn("token_stats", "sol_collected", "TEXT");
 ensureColumn("token_stats", "sol_collected_lamports", "TEXT");
 ensureColumn("token_stats", "liquidity_sol", "REAL DEFAULT 0");
@@ -1227,24 +1230,32 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
 
     if (!seconds) throw new Error("Invalid interval");
 
+    const sinceFilter = since == null || Number.isNaN(since) ? "" : "WHERE bucket_ts >= @since";
+
+    // Timestamp order also orders the interval buckets. DISTINCT can stop its
+    // reverse index scan after finding the requested number of populated buckets.
     return db.prepare(`
-      WITH base AS (
-        SELECT *,
-          CAST(
-            CAST(bucket_ts / ? AS INTEGER) * ?
-            AS INTEGER
-          ) AS tf_bucket
+      WITH eligible AS NOT MATERIALIZED (
+        SELECT *, CAST(CAST(bucket_ts / @seconds AS INTEGER) * @seconds AS INTEGER) AS tf_bucket
         FROM candles_1m
-        WHERE mint = ?
-          AND (? IS NULL OR bucket_ts >= ?)
-          AND open_sol IS NOT NULL
-          AND high_sol IS NOT NULL
-          AND low_sol IS NOT NULL
-          AND close_sol IS NOT NULL
-          AND open_sol > 0
-          AND high_sol > 0
-          AND low_sol > 0
-          AND close_sol > 0
+        WHERE mint = @mint
+          AND open_sol > 0 AND high_sol > 0 AND low_sol > 0 AND close_sol > 0
+      ), recent_buckets AS (
+        SELECT DISTINCT tf_bucket
+        FROM eligible
+        ${sinceFilter}
+        ORDER BY bucket_ts DESC
+        LIMIT @limit
+      ), base AS (
+        SELECT * FROM eligible
+        WHERE bucket_ts >= (
+          -- SQLite truncates toward zero, so a nonpositive bucket can
+          -- include timestamps below its label.
+          SELECT CASE WHEN MIN(tf_bucket) <= 0 THEN MIN(tf_bucket) - @seconds
+                      ELSE MIN(tf_bucket) END
+          FROM recent_buckets
+        )
+          AND (@since IS NULL OR bucket_ts >= @since)
       ), ranked AS (
         SELECT *,
           ROW_NUMBER() OVER (PARTITION BY tf_bucket ORDER BY bucket_ts ASC) AS rn_open,
@@ -1273,8 +1284,8 @@ function getCandles({ mint, interval = "1m", limit = 500, since = null }) {
       )
       SELECT * FROM agg
       ORDER BY bucket_ts DESC
-      LIMIT ?
-    `).all(seconds, seconds, mint, since, since, cappedLimit).reverse();
+      LIMIT @limit
+    `).all({ mint, seconds, since, limit: cappedLimit }).reverse();
   }
 
   return db.prepare(`

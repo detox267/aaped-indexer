@@ -8,7 +8,7 @@ function fixture(t) {
   db.exec(`CREATE TABLE trades(id INTEGER PRIMARY KEY,mint TEXT,created_at INTEGER,block_time INTEGER,quote_asset TEXT,quote_amount TEXT,price_usd REAL,price_quote REAL,side TEXT);
     CREATE TABLE token_stats(mint TEXT,name TEXT,symbol TEXT,image TEXT,price_usd REAL,updated_at INTEGER);
     CREATE TABLE candles_1m(mint TEXT,bucket_ts INTEGER,open_usd REAL,close_usd REAL);
-    CREATE TABLE top_token_state(id INTEGER PRIMARY KEY,mint TEXT,round_start INTEGER,round_end INTEGER,round_volume_usd REAL,round_volume_quote REAL,trades_count INTEGER,buys_count INTEGER,sells_count INTEGER,last_trade_at INTEGER,updated_at INTEGER);`);
+    CREATE TABLE top_token_state(id INTEGER PRIMARY KEY,mint TEXT,round_start INTEGER,round_end INTEGER,round_volume_usd REAL,round_volume_quote REAL,trades_count INTEGER,buys_count INTEGER,sells_count INTEGER,last_trade_at INTEGER,updated_at INTEGER,fusion_pool_id TEXT);`);
   let now=start+HOUR+120000;t.mock.method(Date,"now",()=>now);
   const fusionDb=new Database(":memory:");t.after(()=>fusionDb.close());
   fusionDb.exec(`CREATE TABLE ll_tokens(mint TEXT,data TEXT);
@@ -32,7 +32,7 @@ test("one leaderboard includes both sources; previous completed hour wins, curre
 });
 test("late Fusion catch-up and missing prices hold the existing winner; quiet hours preserve it",t=>{
   const f=fixture(t);f.legacy("legacy",start+1000,1000000000);f.trade("fusion",start+2000,200);
-  f.db.prepare("INSERT INTO top_token_state VALUES(1,?,?,?,?,?,?,?,?,?,?)").run("old",start-HOUR,start,500,5,1,1,0,start-1,0);
+  f.db.prepare("INSERT INTO top_token_state VALUES(1,?,?,?,?,?,?,?,?,?,?,NULL)").run("old",start-HOUR,start,500,5,1,1,0,start-1,0);
   assert.equal(f.board.getLeaderboardsSnapshot().top_token.mint,"old");
   f.coverage();f.trade("fusion",start+3000,null);
   assert.equal(f.board.getLeaderboardsSnapshot().fusion_volume.completed_round_pending,true);
@@ -45,6 +45,32 @@ test("known Fusion mints are not double-counted and exact hour boundaries separa
   const f=fixture(t);f.coverage();f.legacy("fusion",start+HOUR,9000000000);f.trade("fusion",start+HOUR,100);
   f.trade("fusion",start+HOUR-1,75);const snap=f.board.getLeaderboardsSnapshot();
   assert.equal(snap.top10[0].hour_volume_usd,100);assert.equal(snap.top10[0].trades_count,1);assert.equal(snap.top_token.hour_volume_usd,75);
+});
+test("Fusion winners keep their pool outside the current ranking and through a ledger outage", t => {
+  const f = fixture(t);
+  f.coverage();
+  f.trade("fusion", start + 1000, 200);
+  f.trade("fusion", start + HOUR, 10);
+  const initial = f.board.getLeaderboardsSnapshot();
+  assert.equal(initial.top10[0].source, "fusion");
+  assert.equal(initial.top10[0].poolId, "curve");
+  assert.equal(initial.top_token.poolId, "curve");
+  const writes = () => f.db.prepare("SELECT total_changes() n").get().n;
+  const before = writes();
+  f.time(start + HOUR + 124000);
+  f.board.getLeaderboardsSnapshot();
+  assert.equal(writes(), before);
+  const unavailable = createLeaderboards({db: f.db, getPrice: () => null, fusion: createFusionVolume("/nonexistent/fusion.sqlite")});
+  assert.deepEqual(unavailable.getLeaderboardsSnapshot().top10, []);
+  assert.equal(unavailable.getPersistedTopToken().source, "fusion");
+  assert.equal(unavailable.getPersistedTopToken().poolId, "curve");
+
+  f.legacy("legacy", start + HOUR, 5_000_000_000);
+  f.time(start + 2 * HOUR + 120000);
+  const next = f.board.getLeaderboardsSnapshot().top_token;
+  assert.equal(next.mint, "legacy");
+  assert.equal(next.poolId, undefined);
+  assert.equal(next.source, undefined);
 });
 test("large rounds are not truncated at 20000 trades and stored prices are not repriced today",t=>{
   const f=fixture(t);f.coverage();f.db.transaction(()=>{for(let i=0;i<20001;i++)f.legacy("legacy",start+HOUR+1000,1000000,"USDC",1,1);})();

@@ -159,6 +159,9 @@ function getPersistedTopToken() {
     return {
       rank: 1,
       mint: state.mint,
+      ...(state.fusion_pool_id || meta.source === "fusion" ? {
+        source: "fusion", poolId: state.fusion_pool_id || meta.poolId,
+      } : {}),
       name:
         meta.name ||
         meta.launch_name ||
@@ -217,6 +220,7 @@ function persistTopToken(token, roundStart, roundEnd) {
       INSERT INTO top_token_state (
         id,
         mint,
+        fusion_pool_id,
         round_start,
         round_end,
         round_volume_usd,
@@ -227,10 +231,11 @@ function persistTopToken(token, roundStart, roundEnd) {
         last_trade_at,
         updated_at
       )
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id)
       DO UPDATE SET
         mint = excluded.mint,
+        fusion_pool_id = excluded.fusion_pool_id,
         round_start = excluded.round_start,
         round_end = excluded.round_end,
         round_volume_usd = excluded.round_volume_usd,
@@ -240,8 +245,14 @@ function persistTopToken(token, roundStart, roundEnd) {
         sells_count = excluded.sells_count,
         last_trade_at = excluded.last_trade_at,
         updated_at = excluded.updated_at
+      WHERE (mint, fusion_pool_id, round_start, round_end, round_volume_usd, round_volume_quote,
+             trades_count, buys_count, sells_count, last_trade_at)
+        IS NOT (excluded.mint, excluded.fusion_pool_id, excluded.round_start, excluded.round_end,
+                excluded.round_volume_usd, excluded.round_volume_quote, excluded.trades_count,
+                excluded.buys_count, excluded.sells_count, excluded.last_trade_at)
     `).run(
       String(token.mint),
+      token.source === "fusion" ? token.poolId || null : null,
       Number(roundStart),
       Number(roundEnd),
       Number(token.hour_volume_usd || 0),
@@ -329,6 +340,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
 
     const prev = byMint.get(mint) || {
       mint,
+      source: row.source,
       hour_volume_usd: 0,
       hour_volume_quote: 0,
       trades_count: 0,
@@ -371,6 +383,7 @@ function buildKingRound(rows, roundStartMs, roundEndMs, solUsd) {
       return {
         rank: index + 1,
         mint: item.mint,
+        ...(item.source === "fusion" || meta.source === "fusion" ? { source: "fusion", poolId: meta.poolId } : {}),
         name:
           meta.name ||
           meta.launch_name ||

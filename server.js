@@ -1345,8 +1345,8 @@ let homepageSnapshotLastError = null;
 // -----------------------------------------------------------------------------
 // Leaderboards: current-hour top traded tokens
 // -----------------------------------------------------------------------------
-function getPublicCandles(options) {
-  return fusionVolume.candles(options) ?? getCandles(options);
+function getPublicCandles(options, source) {
+  return fusionVolume.candles(options) ?? (source === "fusion" ? [] : getCandles(options));
 }
 
 const fusionVolume = require("./fusion-volume").createFusionVolume();
@@ -1377,7 +1377,7 @@ function buildHomepageSnapshot(reason = "tick") {
         interval: "15m",
         limit: 32,
         since: null,
-      })
+      }, leaderboards.top_token.source)
     : [];
 
   return {
