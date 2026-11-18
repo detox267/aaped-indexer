@@ -480,6 +480,9 @@ function ensureColumn(table, column, definition) {
   }
 }
 
+// The HTTP and publisher processes can start against the same older database.
+db.transaction(() => ensureColumn("top_token_state", "fusion_pool_id", "TEXT")).immediate();
+
 ensureColumn("token_stats", "sol_collected", "TEXT");
 ensureColumn("token_stats", "sol_collected_lamports", "TEXT");
 ensureColumn("token_stats", "liquidity_sol", "REAL DEFAULT 0");
